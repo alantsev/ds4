@@ -1,13 +1,16 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+
+#include <rocwmma/rocwmma.hpp>
+
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
-#include <rocwmma/rocwmma-version.hpp>
 
 #include <hipcub/block/block_radix_sort.hpp>
 
 namespace cub = hipcub;
+namespace wmma = rocwmma;
 
 #define cudaError_t hipError_t
 #define cudaStream_t hipStream_t
@@ -30,7 +33,7 @@ namespace cub = hipcub;
 #define cudaMemLocationTypeDevice hipMemLocationTypeDevice
 
 #define cudaMalloc hipMalloc
-#define cudaMallocHost hipHostMalloc
+#define cudaMallocHost(p1, p2) hipHostMalloc(p1, p2, hipHostMallocDefault)
 #define cudaMallocManaged hipMallocManaged
 #define cudaFree hipFree
 #define cudaFreeHost hipFreeHost
@@ -79,8 +82,9 @@ namespace cub = hipcub;
 #define CUBLAS_DEFAULT_MATH HIPBLAS_DEFAULT_MATH
 #define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
 #define CUBLAS_TF32_TENSOR_OP_MATH HIPBLAS_TF32_TENSOR_OP_MATH
-#define CUDA_R_16F HIPBLAS_R_16F
-#define CUDA_R_32F HIPBLAS_R_32F
+
+#define CUDA_R_16F HIP_R_16F
+#define CUDA_R_32F HIP_R_32F
 
 #define cublasCreate hipblasCreate
 #define cublasDestroy hipblasDestroy
@@ -90,43 +94,80 @@ namespace cub = hipcub;
 #define cublasGemmEx hipblasGemmEx
 #define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
 
+
 template<typename T1, typename T2, typename T3>
-__forceinline__ decltype(auto) myHipFuncSetAttribute(T1&& p1, T2&& p2, T3&& p3) {
+__forceinline__ decltype(auto) ds4_hipFuncSetAttribute(T1&& p1, T2&& p2, T3&& p3) {
     return hipFuncSetAttribute(reinterpret_cast<const void*>(p1), std::forward<T2>(p2), std::forward<T3>(p3));
 }
-#define cudaFuncSetAttribute myHipFuncSetAttribute
+#define cudaFuncSetAttribute ds4_hipFuncSetAttribute
 
 template<typename T1, typename T2, typename T3, typename T4>
-__forceinline__ decltype(auto) myHipMemAdvise(T1&& p1, T2&& p2, T3&& p3, T4&& p4) {
+__forceinline__ decltype(auto) ds4_hipMemAdvise(T1&& p1, T2&& p2, T3&& p3, T4&& p4) {
     return hipMemAdvise(std::forward<T1>(p1), std::forward<T2>(p2), std::forward<T3>(p3), p4.id);
 }
-#define cudaMemAdvise myHipMemAdvise
+#define cudaMemAdvise ds4_hipMemAdvise
 
 template<typename T1, typename T2, typename T3, typename T4, typename T5>
-__forceinline__ decltype(auto) myHipMemPrefetchAsync(T1&& p1, T2&& p2, T3&& p3, T4&& /* p4 */, T5&& p5) {
+__forceinline__ decltype(auto) ds4_hipMemPrefetchAsync(T1&& p1, T2&& p2, T3&& p3, T4&& /* p4 */, T5&& p5) {
     return hipMemPrefetchAsync(std::forward<T1>(p1), std::forward<T2>(p2), p3.id, std::forward<T5>(p5));
 }
-#define cudaMemPrefetchAsync myHipMemPrefetchAsync
+#define cudaMemPrefetchAsync ds4_hipMemPrefetchAsync
 
-static __device__ __forceinline__ int32_t __vcmpne4(uint32_t a, uint32_t b) {
-    // For each byte: 0xFF if a != b, 0x00 if a == b
-    uint32_t diff = a ^ b;
-    // Spread any set bit in each byte to fill the whole byte
-    diff |= (diff >> 1); diff |= (diff >> 2); diff |= (diff >> 4);
-    diff &= 0x01010101u;
-    diff *= 0xFFu; // 0x01 -> 0xFF per byte
-    return (int32_t)diff;
+
+static __device__ __forceinline__ __half ds4_float2half(float x) {
+    if (__builtin_isnan(x)) return __ushort_as_half(0x7E00u);
+    x = fminf(x, 65504.0f);
+    x = fmaxf(x, -65504.0f);
+    return __float2half_rn(x);  // explicit round-to-nearest-even
+}
+#define __float2half ds4_float2half
+
+static __device__ __forceinline__ float ds4_fminf(float a, float b) {
+    if (__builtin_isnan(a)) return b;
+    if (__builtin_isnan(b)) return a;
+    return fminf(a, b);
+}
+#define fminf ds4_fminf
+
+static __device__ __forceinline__ float ds4_fmaxf(float a, float b) {
+    if (__builtin_isnan(a)) return b;
+    if (__builtin_isnan(b)) return a;
+    return fmaxf(a, b);
+}
+#define fmaxf ds4_fmaxf
+
+#define rsqrtf(x) (1.0f / sqrtf(x))
+
+// Precise transcendentals for the MoE router top-k scores, immune to -fapprox-func.
+// These functions are to be used on paths where small error can be translated to 
+// some macro effect - like expert selection kernels
+extern "C" __device__ __attribute__((pure))  float __ocml_exp_f32(float);
+extern "C" __device__ __attribute__((pure))  float __ocml_log1p_f32(float);
+extern "C" __device__ __attribute__((const)) float __ocml_sqrt_f32(float);
+
+static __device__ __forceinline__ float ds4_precise_expf(float x)   { return __ocml_exp_f32(x); }
+static __device__ __forceinline__ float ds4_precise_log1pf(float x) { return __ocml_log1p_f32(x); }
+static __device__ __forceinline__ float ds4_precise_sqrtf(float x)  { return __ocml_sqrt_f32(x); }
+
+typedef int8_t int8x4_t __attribute__((ext_vector_type(4)));
+typedef uint8_t uint8x4_t __attribute__((ext_vector_type(4)));
+
+static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigned int b) {
+    const uint8x4_t& va = reinterpret_cast<const uint8x4_t&>(a);
+    const uint8x4_t& vb = reinterpret_cast<const uint8x4_t&>(b);
+    unsigned int c;
+    uint8x4_t& vc = reinterpret_cast<uint8x4_t&>(c);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        vc[i] = va[i] == vb[i] ? 0x00 : 0xff;
+    }
+    return c;
 }
 
-static __device__ __forceinline__ int32_t __vsub4(int32_t a, int32_t b) {
-    // Per-byte subtraction (wrapping, not saturating)
-    uint32_t ua = (uint32_t)a, ub = (uint32_t)b;
-    // Trick: subtract bytes in parallel avoiding cross-byte borrows
-    uint32_t diff = ((ua | 0x80808080u) - (ub & 0x7F7F7F7Fu)) ^ ((ua ^ ~ub) & 0x80808080u);
-    return (int32_t)diff;
+static __device__ __forceinline__ uint32_t __vsub4(uint32_t a, uint32_t b) {
+    return ((a | 0x80808080u) - (b & 0x7F7F7F7Fu)) ^ ((a ^ ~b) & 0x80808080u);
 }
 
-// __dp4a: dot product of 4 signed int8s packed in an int32
 static __device__ __forceinline__ int32_t __dp4a(int32_t a, int32_t b, int32_t c) {
     const int8_t *a_bytes = reinterpret_cast<const int8_t*>(&a);
     const int8_t *b_bytes = reinterpret_cast<const int8_t*>(&b);
@@ -134,5 +175,51 @@ static __device__ __forceinline__ int32_t __dp4a(int32_t a, int32_t b, int32_t c
              + (int32_t)a_bytes[1] * b_bytes[1]
              + (int32_t)a_bytes[2] * b_bytes[2]
              + (int32_t)a_bytes[3] * b_bytes[3];
+}
+
+__device__ static float warp_sum_f32(float v);
+template <uint32_t ROWS_PER_BLOCK>
+__global__ static void matmul_f16_pair_warp_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim) {
+
+    const uint64_t row_base = (uint64_t)blockIdx.x * ROWS_PER_BLOCK;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+
+    const uint64_t row = row_base + warp;
+    const bool valid0 = row < out0_dim;
+    const bool valid1 = row < out1_dim;
+    if (!valid0 && !valid1) {
+        return;
+    }
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+
+    const __half *wr0 = valid0 ? w0 + row * in_dim : w0;
+    const __half *wr1 = valid1 ? w1 + row * in_dim : w1;
+
+    for (uint64_t i = lane; i < in_dim; i += 32u) {
+
+        const float xv = x[i];
+        if (valid0) sum0 += __half2float(wr0[i]) * xv;
+        if (valid1) sum1 += __half2float(wr1[i]) * xv;
+    }
+
+    sum0 = warp_sum_f32(sum0);
+    sum1 = warp_sum_f32(sum1);
+
+    if (lane == 0) {
+        if (valid0) out0[row] = sum0;
+        if (valid1) out1[row] = sum1;
+    }
 }
 

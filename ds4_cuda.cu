@@ -1,20 +1,39 @@
-#ifdef __HIP_PLATFORM_AMD__
+#ifdef __HIPCC__
 #include "ds4_rocm.h"
+#endif // __HIPCC__
 
-#define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
+#ifdef __HIP_PLATFORM_AMD__
+// ROCM path
+
+#define DS4_FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
+#define DS4_BLAS_COMPUTE_32F CUBLAS_COMPUTE_32F
 using MASK_T = uint64_t;
 
-#else
+#else // __HIP_PLATFORM_AMD__
+// CUDA path
+
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
 
-#define FULL_WARP_MASK 0xFFFFFFFFu
+#define DS4_FULL_WARP_MASK 0xFFFFFFFFu
+#define DS4_BLAS_COMPUTE_32F CUDA_R_32F
 using MASK_T = uint32_t;
+namespace wmma = nvcuda::wmma;
 
-#endif
+// Precise transcendentals for the MoE router top-k scores, immune to -fapprox-func.
+// These functions are to be used on paths where small error can be translated to
+// some macro effect - like expert selection kernels
+// These functions redefined for the ROCm path
+// Probably it should be applied to the CUDA path as well
+static __device__ __forceinline__ float ds4_precise_expf(float x)   { return expf(x); }
+static __device__ __forceinline__ float ds4_precise_log1pf(float x) { return log1pf(x); }
+static __device__ __forceinline__ float ds4_precise_sqrtf(float x)  { return sqrtf(x); }
+
+#endif // __HIP_PLATFORM_AMD__
+
 
 #include <stdint.h>
 #include <errno.h>
@@ -2093,14 +2112,14 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
 
 __device__ static float warp_sum_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(FULL_WARP_MASK, v, offset);
+        v += __shfl_down_sync(DS4_FULL_WARP_MASK, v, offset, 32);
     }
     return v;
 }
 
 __device__ static float warp_max_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        v = fmaxf(v, __shfl_down_sync(FULL_WARP_MASK, v, offset));
+        v = fmaxf(v, __shfl_down_sync(DS4_FULL_WARP_MASK, v, offset, 32));
     }
     return v;
 }
@@ -3631,7 +3650,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
         const float *score_row = scores + warp * 768u;
         for (uint32_t i = lane; i < n_score; i += 32u) max_s = fmaxf(max_s, score_row[i]);
         max_s = warp_max_f32(max_s);
-        max_s = __shfl_sync(FULL_WARP_MASK, max_s, 0);
+        max_s = __shfl_sync(DS4_FULL_WARP_MASK, max_s, 0, 32);
     }
     float den = 0.0f;
     if (valid_head) {
@@ -3643,7 +3662,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
         }
         den = warp_sum_f32(den);
         den += expf(sinks[head] - max_s);
-        den = __shfl_sync(FULL_WARP_MASK, den, 0);
+        den = __shfl_sync(DS4_FULL_WARP_MASK, den, 0, 32);
     }
 
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -3800,7 +3819,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
                               dot4_f32(q2, k2) +
                               dot4_f32(q3, k3);
                 score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(FULL_WARP_MASK, score, 0);
+                score = __shfl_sync(DS4_FULL_WARP_MASK, score, 0, 32);
 
                 const float new_m = fmaxf(max_s, score);
                 const float old_scale = expf(max_s - new_m);
@@ -3924,7 +3943,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
                               dot4_f32(q2, k2) +
                               dot4_f32(q3, k3);
                 score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(FULL_WARP_MASK, score, 0);
+                score = __shfl_sync(DS4_FULL_WARP_MASK, score, 0, 32);
 
                 const float new_m = fmaxf(max_s, score);
                 const float old_scale = expf(max_s - new_m);
@@ -4089,7 +4108,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
                               dot4_f32(q2, k2) +
                               dot4_f32(q3, k3);
                 score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(FULL_WARP_MASK, score, 0);
+                score = __shfl_sync(DS4_FULL_WARP_MASK, score, 0, 32);
 
                 const float new_m = fmaxf(max_s, score);
                 const float old_scale = expf(max_s - new_m);
@@ -4512,8 +4531,8 @@ __global__ static void compressor_shift_ratio4_kernel(float *state_kv, float *st
 
 __device__ static float softplus_dev(float x) {
     if (x > 20.0f) return x;
-    if (x < -20.0f) return expf(x);
-    return log1pf(expf(x));
+    if (x < -20.0f) return ds4_precise_expf(x);
+    return ds4_precise_log1pf(ds4_precise_expf(x));
 }
 
 __global__ static void router_select_kernel(
@@ -4536,7 +4555,7 @@ __global__ static void router_select_kernel(
     int32_t *sel = selected + (uint64_t)t * 6;
     float *w = weights + (uint64_t)t * 6;
 
-    for (int i = 0; i < 256; i++) prob[i] = sqrtf(softplus_dev(log[i]));
+    for (int i = 0; i < 256; i++) prob[i] = ds4_precise_sqrtf(softplus_dev(log[i]));
 
     if (hash_mode) {
         int32_t tok = tokens ? tokens[t] : token_scalar;
@@ -4590,7 +4609,7 @@ __global__ static void router_select_parallel_kernel(
     float *w = weights + (uint64_t)t * 6;
     __shared__ float sprob[256];
 
-    const float p = sqrtf(softplus_dev(log[i]));
+    const float p = ds4_precise_sqrtf(softplus_dev(log[i]));
     sprob[i] = p;
     prob[i] = p;
     __syncthreads();
@@ -4659,12 +4678,13 @@ __global__ static void router_select_warp_topk_kernel(
     #pragma unroll
     for (uint32_t j = 0; j < 8u; j++) {
         const uint32_t e = lane + j * 32u;
-        const float p = sqrtf(softplus_dev(log[e]));
+        const float p = ds4_precise_sqrtf(softplus_dev(log[e]));
         local_prob[j] = p;
         local_score[j] = p + (has_bias ? bias[e] : 0.0f);
         sprob[row_in_block][e] = p;
         prob[e] = p;
     }
+
     __syncwarp();
 
     if (hash_mode) {
@@ -4707,9 +4727,9 @@ __global__ static void router_select_warp_topk_kernel(
         }
         #pragma unroll
         for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
-            const float other_score = __shfl_xor_sync(FULL_WARP_MASK, best_score, mask);
-            const float other_prob = __shfl_xor_sync(FULL_WARP_MASK, best_prob, mask);
-            const uint32_t other_idx = __shfl_xor_sync(FULL_WARP_MASK, best_idx, mask);
+            const float other_score = __shfl_xor_sync(DS4_FULL_WARP_MASK, best_score, mask, 32);
+            const float other_prob = __shfl_xor_sync(DS4_FULL_WARP_MASK, best_prob, mask, 32);
+            const uint32_t other_idx = __shfl_xor_sync(DS4_FULL_WARP_MASK, best_idx, mask, 32);
             if (router_score_better(other_score, other_idx, best_score, best_idx)) {
                 best_score = other_score;
                 best_prob = other_prob;
@@ -4894,8 +4914,7 @@ __global__ static void indexer_scores_wmma_kernel(
         uint32_t ratio,
         float scale,
         int causal) {
-#if __CUDA_ARCH__ >= 700
-    namespace wmma = nvcuda::wmma;
+#if __CUDA_ARCH__ >= 700 || defined (__HIP_DEVICE_COMPILE__)
     const uint32_t tile_c = blockIdx.x * 16u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
@@ -5002,8 +5021,7 @@ __global__ static void indexer_scores_wmma32_kernel(
         uint32_t ratio,
         float scale,
         int causal) {
-#if __CUDA_ARCH__ >= 700
-    namespace wmma = nvcuda::wmma;
+#if __CUDA_ARCH__ >= 700 || defined (__HIP_DEVICE_COMPILE__)
     const uint32_t tile_c = blockIdx.x * 32u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
@@ -5118,8 +5136,7 @@ __global__ static void indexer_scores_wmma64_kernel(
         uint32_t ratio,
         float scale,
         int causal) {
-#if __CUDA_ARCH__ >= 700
-    namespace wmma = nvcuda::wmma;
+#if __CUDA_ARCH__ >= 700 || defined (__HIP_DEVICE_COMPILE__)
     const uint32_t tile_c = blockIdx.x * 64u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
@@ -5234,8 +5251,7 @@ __global__ static void indexer_scores_wmma128_kernel(
         uint32_t ratio,
         float scale,
         int causal) {
-#if __CUDA_ARCH__ >= 700
-    namespace wmma = nvcuda::wmma;
+#if __CUDA_ARCH__ >= 700 || defined (__HIP_DEVICE_COMPILE__)
     const uint32_t tile_c = blockIdx.x * 128u;
     const uint32_t tile_t = blockIdx.y * 16u;
     const uint32_t tid = threadIdx.x;
@@ -6272,7 +6288,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                              out->ptr,
                                              CUDA_R_32F,
                                              (int)out_dim,
-                                             CUBLAS_COMPUTE_32F,
+                                             DS4_BLAS_COMPUTE_32F,
                                              CUBLAS_GEMM_DEFAULT);
             if (st == CUBLAS_STATUS_SUCCESS) return 1;
             fprintf(stderr, "ds4: cuBLAS q8 f16 matmul failed: status %d\n", (int)st);
@@ -6514,7 +6530,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
                                          out->ptr,
                                          CUDA_R_32F,
                                          (int)out_dim,
-                                         CUBLAS_COMPUTE_32F,
+                                         DS4_BLAS_COMPUTE_32F,
                                          CUBLAS_GEMM_DEFAULT);
         return cublas_ok(st, "f16 matmul");
     }
@@ -6569,7 +6585,27 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     }
     const __half *w0 = (const __half *)cuda_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
     const __half *w1 = (const __half *)cuda_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
+
     if (!w0 || !w1) return 0;
+
+#ifdef __HIP_PLATFORM_AMD__
+    if (!getenv("DS4_ROCM_NO_F16_PAIR_WARP_MATMUL")) {
+        constexpr uint32_t ROWS_PER_BLOCK = 8u;
+        const uint32_t grid = (uint32_t)((out_dim + ROWS_PER_BLOCK - 1u) / ROWS_PER_BLOCK);
+        matmul_f16_pair_warp_kernel<ROWS_PER_BLOCK><<<grid, ROWS_PER_BLOCK * 32>>>(
+            (float *)out0->ptr,
+            (float *)out1->ptr,
+            w0,
+            w1,
+            (const float *)x->ptr,
+            in_dim,
+            out_dim,
+            out_dim);
+
+        return cuda_ok(cudaGetLastError(), "matmul_f16_pair_warp launch");
+    }
+#endif
+
     matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
         (float *)out0->ptr,
         (float *)out1->ptr,
@@ -7846,7 +7882,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                        (int)rank,
                                                        (long long)rank * n_tokens,
                                                        (int)n_groups,
-                                                       CUBLAS_COMPUTE_32F,
+                                                       DS4_BLAS_COMPUTE_32F,
                                                        CUBLAS_GEMM_DEFAULT);
         if (!cublas_ok(st, "attention output a gemm")) return 0;
         attention_unpack_group_low_kernel<<<(low_tmp_count + 255) / 256, 256>>>(
