@@ -1570,9 +1570,13 @@ static void test_metal_mpp_equivalence(void) {
 
     char *saved_disable_metal4 = test_save_env("DS4_METAL_DISABLE_METAL4");
     setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
+    // Use determenistic execution path for the test on CUDA / ROCm
+    char *saved_no_atomic_down = test_save_env("DS4_CUDA_MOE_NO_ATOMIC_DOWN");
+    setenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN", "1", 1);
     ds4_engine *ref_engine = test_open_engine(false);
     if (!ref_engine) {
         test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
+        test_restore_env("DS4_CUDA_MOE_NO_ATOMIC_DOWN", saved_no_atomic_down);
         return;
     }
 
@@ -1592,6 +1596,7 @@ static void test_metal_mpp_equivalence(void) {
     test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
 
     test_run_mpp_candidate("auto", cases, ncase);
+    test_restore_env("DS4_CUDA_MOE_NO_ATOMIC_DOWN", saved_no_atomic_down);
 
     for (int i = 0; i < ncase; i++) test_mpp_eq_case_free(&cases[i]);
 }
