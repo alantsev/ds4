@@ -1,4 +1,6 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
+#include "ds4_help.h"
 
 /* ds4-eval: small built-in benchmark integration test.
  *
@@ -9,10 +11,17 @@
  * a fixed two-pane layout.
  *
  * The embedded questions are small fixed subsets of GPQA Diamond, SuperGPQA,
- * and AIME 2025.  GPQA is released under CC BY 4.0.  SuperGPQA is released
- * under ODC-BY and includes mostly original data plus a limited amount of
- * transformed third-party data.  The AIME 2025 mirror used here is MIT
- * licensed.  Source mirrors used while preparing this file:
+ * AIME 2025, and COMPSEC.  The SuperGPQA slice is intentionally audited: rows
+ * with wrong keys, missing figures, or underspecified prompts are replaced
+ * instead of being locally re-keyed, because ds4-eval is a regression harness
+ * and a bad target is worse than a merely hard target.  COMPSEC contains a
+ * small audited subset of reduced C/C++ single-function vulnerability
+ * localization questions derived from public CVE writeups; the CVE anchors and
+ * private rationales are not rendered to the model.
+ * GPQA is released under CC BY 4.0.  SuperGPQA is released under ODC-BY and
+ * includes mostly original data plus a limited amount of transformed
+ * third-party data.  The AIME 2025 mirror used here is MIT licensed.  Source
+ * mirrors used while preparing this file:
  * https://huggingface.co/datasets/Wanfq/gpqa
  * https://huggingface.co/datasets/m-a-p/SuperGPQA
  * https://huggingface.co/datasets/test-time-compute/aime_2025
@@ -46,12 +55,15 @@
 #define ANSI_BOLD "\x1b[1m"
 
 #define EVAL_MAX_CHOICES 10
-#define EVAL_ANSWER_MAX 16
+#define EVAL_ANSWER_MAX 32
+#define EVAL_MAX_CONTEXT 1000000
 
 typedef enum {
     EVAL_PENDING,
     EVAL_PREFILL,
     EVAL_THINKING,
+    EVAL_SKIPPED,
+    EVAL_STOPPED,
     EVAL_PASSED,
     EVAL_FAILED,
 } eval_status;
@@ -60,6 +72,7 @@ typedef enum {
     EVAL_RUN_OK,
     EVAL_RUN_ERROR,
     EVAL_RUN_SWITCH,
+    EVAL_RUN_QUIT,
 } eval_run_result;
 
 typedef enum {
@@ -208,21 +221,21 @@ static const eval_case eval_cases[] = {
     },
     {
         .source = "SuperGPQA",
-        .id = "20a40e5c0ca14934a0d59db6d9500487",
+        .id = "6082513c8dba4ec68aa68f1bf5854d09",
         .domain = "Law",
-        .title = "Which city does the 'Adachi Ward Anti-Anti-Social Organization",
-        .question = "Which city does the 'Adachi Ward Anti-Anti-Social Organization Regulation Ordinance' belong to?",
-        .choice[0] = "Adachi, Saitama, Japan",
-        .choice[1] = "Kyoto, Japan",
-        .choice[2] = "Adachi, Japan",
-        .choice[3] = "Yokohama, Japan",
-        .choice[4] = "Saitama, Japan",
-        .choice[5] = "Nagoya, Japan",
-        .choice[6] = "Adachi, Tokyo, Japan (metropolitan area)",
-        .choice[7] = "Adachi, Tokyo, Japan",
-        .choice[8] = "Osaka, Japan",
-        .choice[9] = "Tokyo, Japan",
-        .answer = "J",
+        .title = "What is the concept called that suggests crime can be reduced",
+        .question = "What is the concept called that suggests crime can be reduced by altering the physical features of an environment?",
+        .choice[0] = "Defensible space",
+        .choice[1] = "Zone of transition",
+        .choice[2] = "Sanitized zone",
+        .choice[3] = "Defended area",
+        .choice[4] = "Environmental design",
+        .choice[5] = "Environmental modification",
+        .choice[6] = "Defended space",
+        .choice[7] = "None of the other choices",
+        .choice[8] = "Environmental deterrence",
+        .choice[9] = "Environmental defense",
+        .answer = "A",
     },
     {
         .source = "AIME2025",
@@ -233,12 +246,12 @@ static const eval_case eval_cases[] = {
         .answer = "16",
     },
     {
-        .source = "GPQA Diamond",
+        .source = "GPQA Diamond (modified)",
         .id = "recDytVnNYZe2HuUU",
         .domain = "Physics",
         .title = "What is the energy of the Relativistic Heavy Ion Collider (RHIC)",
         .question = "What is the energy of the Relativistic Heavy Ion Collider (RHIC) so that the speed of the nucleus X is equal to 0.96c?\n\nKnowing that X is defined as Li with 3 neutrons.\n\nPS: the precision of the energy is at 1e-4.",
-        .choice[0] = "20.132 GeV",
+        .choice[0] = "20.011 GeV",
         .choice[1] = "18.475 GeV",
         .choice[2] = "21.419",
         .choice[3] = "23.069 GeV",
@@ -322,21 +335,21 @@ static const eval_case eval_cases[] = {
     },
     {
         .source = "SuperGPQA",
-        .id = "c1433ac557eb4623ab3d6825901d439c",
-        .domain = "Science",
-        .title = "What was the first land plant to appear on Earth?",
-        .question = "What was the first land plant to appear on Earth?",
-        .choice[0] = "Prionophyta",
-        .choice[1] = "Protofungia",
-        .choice[2] = "Gymnospermia",
-        .choice[3] = "Bryophytema",
-        .choice[4] = "Pteridophyta",
-        .choice[5] = "Mouldosperma",
-        .choice[6] = "Gymnomossia",
-        .choice[7] = "Floridophyta",
-        .choice[8] = "Bryophytina",
-        .choice[9] = "Algalophyta",
-        .answer = "C",
+        .id = "d44b94f7749345a39a65f6312bda8764",
+        .domain = "Engineering",
+        .title = "Given the system $H(s)=(s+k)/(s^2+2s+k)$ is",
+        .question = "Given the system $H(s)=\\frac{s+k}{s^2+2s+k}$ is a minimum phase system, then the range of $k$ is?",
+        .choice[0] = "$k<-1$",
+        .choice[1] = "$k \\geq 1$",
+        .choice[2] = "$k \\geq 0$",
+        .choice[3] = "$k<0$",
+        .choice[4] = "$k>0$",
+        .choice[5] = "$0<k<1$",
+        .choice[6] = "$k>1$",
+        .choice[7] = "$0 \\leq k < 1$",
+        .choice[8] = "$k \\geq -1$",
+        .choice[9] = "$k>-1$",
+        .answer = "E",
     },
     {
         .source = "AIME2025",
@@ -398,21 +411,21 @@ static const eval_case eval_cases[] = {
     },
     {
         .source = "SuperGPQA",
-        .id = "0380753927db4f9d8cc2a946cf068c09",
-        .domain = "Agronomy",
-        .title = "Insects have different types of mouthparts depending on their",
-        .question = "Insects have different types of mouthparts depending on their dietary habits. For example, the siphoning mouthparts of a butterfly feature a coiled proboscis, primarily specialized from which part of the mouthparts?",
-        .choice[0] = "Rostrum",
-        .choice[1] = "Labrum",
-        .choice[2] = "Palate",
-        .choice[3] = "Upper lip",
-        .choice[4] = "Mandible",
-        .choice[5] = "Hypopharynx",
-        .choice[6] = "Tongue",
-        .choice[7] = "Chelicera",
-        .choice[8] = "Lower lip",
-        .choice[9] = "Maxilla",
-        .answer = "E",
+        .id = "31950dc80ded400a9181f50626d1f75c",
+        .domain = "Science",
+        .title = "Evaluate the definite integral of the absolute logarithm",
+        .question = "Evaluate the definite integral $\\int_{1/e}^{e} |\\ln x|\\,dx$.",
+        .choice[0] = "$1-2/e$",
+        .choice[1] = "$2$",
+        .choice[2] = "$2-2/e$",
+        .choice[3] = "$2-2/e^3$",
+        .choice[4] = "$2-1/e^3$",
+        .choice[5] = "$1-1/e$",
+        .choice[6] = "$2-1/e^2$",
+        .choice[7] = "$2-2/e^2$",
+        .choice[8] = "$2-1/e$",
+        .choice[9] = "$2/e$",
+        .answer = "C",
     },
     {
         .source = "AIME2025",
@@ -512,20 +525,21 @@ static const eval_case eval_cases[] = {
     },
     {
         .source = "SuperGPQA",
-        .id = "b02cdc130ac24dada45a461a8a1e0e11",
+        .id = "9f93aa2cfdb547b5b3a4623f80f7fff6",
         .domain = "Engineering",
-        .title = "Which of the following statements about the necessary conditions",
-        .question = "Which of the following statements about the necessary conditions for producing wheel peripheral traction is correct? (Choose the option that includes all the correct statements)\nI. The locomotive driving wheels receive torque transmitted from the power transmission device. II. The output shaft of the diesel engine can only rotate in one direction. III. Friction exists between the driving wheels and the steel rails. IV. The power of the diesel engine is proportional to n, and the diesel engine generally operates near the condition n = n_{\\text{max}}.",
-        .choice[0] = "I, III, IV",
-        .choice[1] = "I, IV",
-        .choice[2] = "I, II, III, IV, V",
-        .choice[3] = "I, II, IV",
-        .choice[4] = "II, IV",
-        .choice[5] = "II, III, IV",
-        .choice[6] = "I, II, III, IV",
-        .choice[7] = "I,II",
-        .choice[8] = "I, III",
-        .answer = "C",
+        .title = "A channel samples once every 1/8 second, and the transmission",
+        .question = "A channel samples once every 1/8 second, and the transmission signal has a total of 16 different states. The maximum data transmission rate is ().",
+        .choice[0] = "48b/s",
+        .choice[1] = "64b/s",
+        .choice[2] = "96b/s",
+        .choice[3] = "12b/s",
+        .choice[4] = "4b/s",
+        .choice[5] = "8b/s",
+        .choice[6] = "128b/s",
+        .choice[7] = "16b/s",
+        .choice[8] = "32b/s",
+        .choice[9] = "24b/s",
+        .answer = "I",
     },
     {
         .source = "AIME2025",
@@ -775,21 +789,21 @@ static const eval_case eval_cases[] = {
     },
     {
         .source = "SuperGPQA",
-        .id = "c824381a4064466682d88eddfce44a5b",
+        .id = "e1825d70c5844c22933087eafa89e39c",
         .domain = "Engineering",
-        .title = "Suppose that a tank containing a certain liquid has an outlet",
-        .question = "Suppose that a tank containing a certain liquid has an outlet near the bottom. Let $h(t)$ be the height of the liquid surface above the outlet at time $t$. Torricelli's principle states that the outflow velocity $v$ at the outlet is equal to the velocity of a particle falling freely (with no drag) from the height $h$.\nConsider a water tank in the form of a right circular cylinder that is $3 \\mathrm{~m}$ high above the outlet. The radius of the tank is $1 \\mathrm{~m}$ and the radius of the circular outlet is $0.1 \\mathrm{~m}$. If the tank is initially full of water, determine how long it takes to drain the tank down to the level of the outlet.",
-        .choice[0] = "110.36 s",
-        .choice[1] = "130.41 s",
-        .choice[2] = "175.55 s",
-        .choice[3] = "200.62 s",
-        .choice[4] = "85.30 s",
-        .choice[5] = "120.25 s",
-        .choice[6] = "160.48 s",
-        .choice[7] = "150.20 s",
-        .choice[8] = "105.67 s",
-        .choice[9] = "98.75 s",
-        .answer = "B",
+        .title = "The transfer function of the system is g(s)=(s^2+3s+2)",
+        .question = "The transfer function of the system is \\(g(s)=\\dfrac{s^2+3s+2}{s(s^2+7s+12)}\\). Perform partial fraction decomposition on it, and the result is",
+        .choice[0] = "\\(\\dfrac{2/3}{s+3}+\\dfrac{3/2}{s+4}\\)",
+        .choice[1] = "\\dfrac{1/6}{s}+\\dfrac{2/3}{s+3}-\\dfrac{3/2}{s-4}",
+        .choice[2] = "\\(\\dfrac{1/6}{s}+\\dfrac{2/3}{s+3}-\\dfrac{3/2}{s+4}\\)",
+        .choice[3] = "\\(\\dfrac{1/6}{s}+\\dfrac{2/3}{s-3}+\\dfrac{3/2}{s-4}\\)",
+        .choice[4] = "\\(\\dfrac{1/6}{s}+\\dfrac{2/3}{s-3}-\\dfrac{3/2}{s-4}\\)",
+        .choice[5] = "\\(\\dfrac{1/6}{s}+\\dfrac{2/3}{s-3}-\\dfrac{3/2}{s+4}\\)",
+        .choice[6] = "\\(\\dfrac{1/6}{s}-\\dfrac{2/3}{s-3}+\\dfrac{3/2}{s+4}\\)",
+        .choice[7] = "\\dfrac{1/6}{s}-\\dfrac{2/3}{s-3}-\\dfrac{3/2}{s-4}",
+        .choice[8] = "\\(\\dfrac{1/6}{s}-\\dfrac{2/3}{s-3}-\\dfrac{3/2}{s+4}\\)",
+        .choice[9] = "\\(\\dfrac{1/6}{s}-\\dfrac{2/3}{s+3}+\\dfrac{3/2}{s+4}\\)",
+        .answer = "J",
     },
     {
         .source = "AIME2025",
@@ -813,21 +827,21 @@ static const eval_case eval_cases[] = {
     },
     {
         .source = "SuperGPQA",
-        .id = "9254e41181d1414b8dfdc927f6f85c96",
+        .id = "ab430ac3f18e4e02a2cb3f35498c6b30",
         .domain = "Engineering",
-        .title = "Water (with refractive index = $\\frac{4}{3}$) in a tank is 18 cm",
-        .question = "Water (with refractive index = $\\frac{4}{3}$) in a tank is 18 cm deep. Oil of refractive index $\\frac{7}{4}$ lies on water making a convex surface of radius of curvature R = 6 cm as shown. Consider oil to act as a thin lens. An object S is placed 24 cm above water surface. The location of its image is at x cm above the bottom of the tank. Find the value of x.",
-        .choice[0] = "2.1 cm",
-        .choice[1] = "2.5 cm",
-        .choice[2] = "1.9 cm",
-        .choice[3] = "2.4 cm",
-        .choice[4] = "1.5 cm",
-        .choice[5] = "2.3 cm",
-        .choice[6] = "2.2 cm",
-        .choice[7] = "1 cm",
-        .choice[8] = "2 cm",
-        .choice[9] = "1.8 cm",
-        .answer = "I",
+        .title = "Assuming the signal x(t)=(sin(50*pi*t)/(pi*t))^2",
+        .question = "Assuming the signal $x(t)=(\\frac{\\sin(50\\pi t)}{\\pi t})^2$ has a Fourier transform result of $X(j\\omega)$, with a sampling frequency $\\omega_s=150\\pi$, the sampled signal is $g(t)$, and the Fourier transform of $g(t)$ is $G(j\\omega)$. If $G(j\\omega)$ is required to satisfy: $G(j\\omega)=75X(j\\omega) \\quad for \\quad |\\omega|\\leq\\omega_0$, what is the maximum value of $\\omega_0$?",
+        .choice[0] = "50\\pi",
+        .choice[1] = "37.5\\pi",
+        .choice[2] = "150\\pi",
+        .choice[3] = "125\\pi",
+        .choice[4] = "43.75\\pi",
+        .choice[5] = "62.5\\pi",
+        .choice[6] = "75\\pi",
+        .choice[7] = "25\\pi",
+        .choice[8] = "87.5\\pi",
+        .choice[9] = "100\\pi",
+        .answer = "A",
     },
     {
         .source = "AIME2025",
@@ -1026,6 +1040,142 @@ static const eval_case eval_cases[] = {
         .question = "There are exactly three positive real numbers $k$ such that the function\n$$f(x) = \\frac{(x - 18)(x - 72)(x - 98)(x - k)}{x}$$\ndefined over the positive real numbers achieves its minimum value at exactly two positive real numbers $x$. Find the sum of these three values of $k$.",
         .answer = "240",
     },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-076",
+        .domain = "FreeBSD / librpcsec_gss",
+        .title = "rpcsec_gss_validate() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe function validates a per-request authentication blob before passing it to the GSS layer.\n\nCode:\n```c\n 1: #define AUTH_STACK_MAX 256\n 2: \n 3: static bool check_rpcsec_packet(const uint8_t *wire, size_t wire_left)\n 4: {\n 5:     if (wire_left < 4)\n 6:         return false;\n 7: \n 8:     uint32_t body_len = get_be32(wire);      // attacker-controlled length field\n 9:     const uint8_t *body = wire + 4;\n10:     uint8_t scratch[AUTH_STACK_MAX];\n11: \n12:     /* XDR opaque values are padded to 4-byte alignment on the wire. */\n13:     uint32_t pad = (4 - (body_len & 3)) & 3;\n14:     uint32_t encoded_len = body_len + pad;\n15: \n16:     /* This check only proves the source bytes exist in the packet. */\n17:     if (encoded_len > wire_left - 4)\n18:         return false;\n19: \n20:     memcpy(scratch, body, encoded_len);\n21:     return gss_verify_mic(scratch, body_len);\n22: }\n```",
+        .answer = "17-20",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-077",
+        .domain = "GNU Inetutils telnetd",
+        .title = "add_slc() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThis helper is called once for each Special Line Character option received in a TELNET LINEMODE negotiation.\n\nCode:\n```c\n 1: #define SLCBUF_SIZE 108\n 2: #define SLC_NCHARS 18\n 3: \n 4: struct slc_state {\n 5:     unsigned char buf[SLCBUF_SIZE];\n 6:     size_t used;\n 7: };\n 8: \n 9: static void add_slc(struct slc_state *s,\n10:                     unsigned char func,\n11:                     unsigned char flags,\n12:                     unsigned char value)\n13: {\n14:     if (func <= SLC_NCHARS)\n15:         return;                    // ignore ordinary entries here\n16: \n17:     /* Store one SLC triplet for later reply construction. */\n18:     s->buf[s->used++] = func;\n19:     s->buf[s->used++] = flags;\n20:     s->buf[s->used++] = value;\n21: }\n```",
+        .answer = "18-20",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-078",
+        .domain = "Botan",
+        .title = "sm2_decrypt_and_check_c3() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe function checks the SM2 C3 hash in a decoded ciphertext. Assume parse_sm2_ciphertext() may return a c3 field of any length.\n\nCode:\n```c\n 1: #define SM3_DIGEST_LEN 32\n 2: \n 3: static bool check_sm2_c3(const uint8_t *msg, size_t msg_len,\n 4:                          const struct sm2_ctext *ct)\n 5: {\n 6:     uint8_t expected[SM3_DIGEST_LEN];\n 7: \n 8:     sm3_c3_hash(expected, ct->x2, ct->x2_len, msg, msg_len, ct->y2, ct->y2_len);\n 9: \n10:     /* Constant-time comparison: returns 0 only if all bytes match. */\n11:     if (ct_memcmp(expected, ct->c3.data, SM3_DIGEST_LEN) != 0)\n12:         return false;\n13: \n14:     return true;\n15: }\n```",
+        .answer = "11",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-079",
+        .domain = "Botan",
+        .title = "tls13_server_handle_record() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe server is configured to require TLS 1.3 client authentication. Inspect the reduced record handler.\n\nCode:\n```c\n 1: enum State { NeedClientCert, NeedCertVerify, NeedFinished, Established };\n 2: \n 3: static void handle_tls13_record(struct Conn *c, const Record& r)\n 4: {\n 5:     if (r.type == Alert)\n 6:         return close_conn(c);\n 7: \n 8:     if (r.type == Handshake) {\n 9:         if (r.msg == Certificate && c->state == NeedClientCert)\n10:             c->state = NeedCertVerify;\n11:         else if (r.msg == CertificateVerify && c->state == NeedCertVerify)\n12:             c->state = NeedFinished;\n13:         else if (r.msg == Finished && c->state == NeedFinished)\n14:             c->state = Established;\n15:         return;\n16:     }\n17: \n18:     if (r.type == ApplicationData) {\n19:         decrypt_and_dispatch_application_data(c, r);\n20:         return;\n21:     }\n22: }\n```",
+        .answer = "18-19",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-080",
+        .domain = "Botan",
+        .title = "validate_path_step() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe validator is walking a certificate chain. trust_store.contains_subject(x) returns true if any configured trust anchor has subject DN x.\n\nCode:\n```c\n 1: static ValidationResult validate_path_step(const Certificate& cert,\n 2:                                            const TrustStore& trust_store)\n 3: {\n 4:     /* Optimization: stop once we have reached a known trust anchor subject. */\n 5:     if (trust_store.contains_subject(cert.subject_dn()))\n 6:         return ValidationResult::Valid;\n 7: \n 8:     Certificate issuer = find_issuer_for(cert);\n 9:     if (!cert.verify_signature_with(issuer.public_key()))\n10:         return ValidationResult::BadSignature;\n11: \n12:     return validate_path_step(issuer, trust_store);\n13: }\n```",
+        .answer = "5-6",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-081",
+        .domain = "uds-c",
+        .title = "send_diagnostic_request() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe diagnostic request builder has small protocol-defined fields.\n\nCode:\n```c\n 1: #define MAX_DIAG_PAYLOAD       6\n 2: #define MAX_REQUEST_PAYLOAD    7\n 3: \n 4: static int send_diagnostic_request(uint8_t sid,\n 5:                                    const uint8_t *pid, size_t pid_len,\n 6:                                    const uint8_t *payload, size_t payload_len)\n 7: {\n 8:     uint8_t req[MAX_DIAG_PAYLOAD];\n 9: \n10:     if (pid_len > 2 || payload_len > MAX_REQUEST_PAYLOAD)\n11:         return -1;\n12: \n13:     req[0] = sid;\n14:     memcpy(req + 1, pid, pid_len);\n15:     memcpy(req + 1 + pid_len, payload, payload_len);\n16: \n17:     return transport_send(req, 1 + pid_len + payload_len);\n18: }\n```",
+        .answer = "10-15",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-082",
+        .domain = "Firebird",
+        .title = "xdr_datum() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe decoder writes a cstring value into a slice selected by a descriptor. xdr_bytes_available() is accurate.\n\nCode:\n```c\n 1: static bool xdr_datum(struct Xdr *xdr, const struct SliceDesc *desc, char *base)\n 2: {\n 3:     uint32_t n = xdr_get_u32(xdr);       // declared cstring length\n 4:     char *dst = base + desc->offset;\n 5: \n 6:     if (n > xdr_bytes_available(xdr))\n 7:         return false;\n 8: \n 9:     xdr_read_bytes(xdr, dst, n);\n10:     dst[n] = '\\0';\n11:     return true;\n12: }\n```",
+        .answer = "9-10",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-083",
+        .domain = "Firebird",
+        .title = "decode_specific_data_segments() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe authentication decoder stores numbered CNCT_specific_data segments. Inputs are not guaranteed to arrive in ascending segment order.\n\nCode:\n```c\n 1: static bool read_segments(struct ConnAuth *a, struct Packet *p)\n 2: {\n 3:     int last = -1;\n 4: \n 5:     while (packet_has_segment(p)) {\n 6:         int segno = packet_get_segment_number(p);\n 7:         size_t len = packet_get_segment_length(p);\n 8: \n 9:         int missing = segno - last - 1;\n10:         a->segments.grow(a->segments.size() + missing);\n11:         a->segments[segno] = packet_read_bytes(p, len);\n12: \n13:         last = segno;\n14:     }\n15:     return true;\n16: }\n```",
+        .answer = "9-11",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-084",
+        .domain = "PHP",
+        .title = "php_url_decode() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nOn this target, plain char is signed, and the ctype implementation indexes a table for values other than EOF.\n\nCode:\n```c\n 1: static size_t decode_component(char *s, size_t len)\n 2: {\n 3:     size_t r = 0, w = 0;\n 4: \n 5:     while (r < len) {\n 6:         if (s[r] == '%' && r + 2 < len &&\n 7:             isxdigit(s[r + 1]) && isxdigit(s[r + 2])) {\n 8:             s[w++] = hexpair(s[r + 1], s[r + 2]);\n 9:             r += 3;\n10:         } else {\n11:             s[w++] = s[r++];\n12:         }\n13:     }\n14:     return w;\n15: }\n```",
+        .answer = "6-7",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-085",
+        .domain = "PHP PDO Firebird",
+        .title = "pdo_firebird_quote_token() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe database driver receives a language string token as (ptr,len), where len may include embedded NUL bytes. The function reconstructs a quoted SQL token.\n\nCode:\n```c\n1: static void append_quoted_token(char *sql, size_t sql_cap,\n2:                                 const char *tok, size_t tok_len)\n3: {\n4:     strlcat(sql, \"'\", sql_cap);\n5:     strncat(sql, tok, tok_len);\n6:     strlcat(sql, \"'\", sql_cap);\n7: }\n```",
+        .answer = "5",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-086",
+        .domain = "libexpat",
+        .title = "doContent() tag-buffer reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe parser grows a reusable tag buffer before copying the current element name and closing delimiters. Sizes are attacker-influenced through XML input.\n\nCode:\n```c\n 1: static bool ensure_tag_buffer(struct Parser *p, size_t prefix_len, size_t name_len)\n 2: {\n 3:     unsigned int need = (unsigned int)(prefix_len + name_len + 3);\n 4: \n 5:     if (need > p->tag_cap) {\n 6:         char *q = realloc(p->tag_buf, need);\n 7:         if (q == NULL)\n 8:             return false;\n 9:         p->tag_buf = q;\n10:         p->tag_cap = need;\n11:     }\n12: \n13:     memcpy(p->tag_buf, p->prefix, prefix_len);\n14:     memcpy(p->tag_buf + prefix_len, p->name, name_len);\n15:     memcpy(p->tag_buf + prefix_len + name_len, \"/>\\0\", 3);\n16:     return true;\n17: }\n```",
+        .answer = "3,13-15",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-087",
+        .domain = "Mbed TLS",
+        .title = "x509_inet_pton_ipv6() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThis helper parses an IPv6 address used in X.509 name constraints. It records where :: compression occurred, then shifts already parsed bytes.\n\nCode:\n```c\n 1: static int parse_ipv6_reduced(const char *src, uint8_t dst[16])\n 2: {\n 3:     uint8_t tmp[16];\n 4:     uint8_t *tp = tmp;\n 5:     uint8_t *colonp = NULL;\n 6: \n 7:     if (src[0] == ':' && src[1] == ':') {\n 8:         colonp = --tp;          // remember compression point at the beginning\n 9:         src += 2;\n10:     }\n11: \n12:     while (*src != '\\0') {\n13:         unsigned v = parse_hextet(&src);\n14:         *tp++ = (uint8_t)(v >> 8);\n15:         *tp++ = (uint8_t)v;\n16:         if (*src == ':') src++;\n17:     }\n18: \n19:     if (colonp != NULL) {\n20:         size_t n = (size_t)(tp - colonp);\n21:         memmove(colonp + (16 - (tp - tmp)), colonp, n);\n22:         memset(colonp, 0, 16 - (tp - tmp));\n23:     }\n24: \n25:     memcpy(dst, tmp, 16);\n26:     return 0;\n27: }\n```",
+        .answer = "8,20-22",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-088",
+        .domain = "Mbed TLS",
+        .title = "mbedtls_dhm_export_public() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe function exports a finite-field Diffie-Hellman public value into a fixed-width buffer for the group. The public MPI may be supplied by an application.\n\nCode:\n```c\n 1: static int export_ffdh_public(const struct DhmContext *ctx,\n 2:                               uint8_t *out, size_t out_len)\n 3: {\n 4:     size_t plen = mpi_size(&ctx->P);      // byte length of the group prime\n 5:     size_t ylen = mpi_size(&ctx->Y);      // byte length of public value\n 6: \n 7:     if (out_len < plen)\n 8:         return -1;\n 9: \n10:     memset(out, 0, plen);\n11:     return mpi_write_binary(&ctx->Y, out + (plen - ylen), ylen);\n12: }\n```",
+        .answer = "11",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-089",
+        .domain = "Mbed TLS",
+        .title = "mbedtls_ccm_finish() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe public multipart CCM API lets the caller request a tag length.\n\nCode:\n```c\n 1: static int ccm_finish_reduced(struct CcmCtx *ctx, uint8_t *tag, size_t tag_len)\n 2: {\n 3:     uint8_t full_tag[16];\n 4: \n 5:     ccm_compute_full_tag(ctx, full_tag);\n 6: \n 7:     if (tag == NULL)\n 8:         return -1;\n 9: \n10:     memcpy(tag, full_tag, tag_len);\n11:     return 0;\n12: }\n```",
+        .answer = "10",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-090",
+        .domain = "Linux kernel",
+        .title = "handle_one_ule_extension() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe extension type is the low byte of a 16-bit protocol field. The mandatory-extension table has handlers for values 0 through 254.\n\nCode:\n```c\n 1: typedef int (*ule_handler)(struct skb *, const uint8_t *, size_t);\n 2: static ule_handler mandatory_handlers[255];\n 3: \n 4: static int handle_ule_ext(struct skb *skb, uint16_t type,\n 5:                           const uint8_t *p, size_t len)\n 6: {\n 7:     uint8_t htype = (uint8_t)(type & 0x00ff);\n 8: \n 9:     if (htype < 0x80)\n10:         return handle_optional_ext(skb, htype, p, len);\n11: \n12:     if (mandatory_handlers[htype] != NULL)\n13:         return mandatory_handlers[htype](skb, p, len);\n14: \n15:     return -EINVAL;\n16: }\n```",
+        .answer = "12-13",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-091",
+        .domain = "Linux kernel USB gadget storage",
+        .title = "check_command_size() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe SCSI command expresses transfer length in logical blocks. blkbits is the log2 block size.\n\nCode:\n```c\n 1: static int accept_transfer(struct lun *lun, uint32_t blocks, unsigned blkbits)\n 2: {\n 3:     uint32_t bytes = blocks << blkbits;\n 4: \n 5:     if (bytes > lun->backing_size)\n 6:         return -EINVAL;\n 7: \n 8:     lun->data_size_from_cmnd = bytes;\n 9:     return 0;\n10: }\n```",
+        .answer = "3",
+    },
+    {
+        .source = "COMPSEC",
+        .id = "compsec-092",
+        .domain = "Linux kernel AppArmor",
+        .title = "verify_dfa() reduction",
+        .question = "Analyze this reduced C/C++ function. It may or may not contain a vulnerability.\nReply with the single best line number where the primary bug is introduced. If the bug is only clear from a small group of adjacent lines, reply with the smallest comma-separated set of exact line numbers.\nReturn 0 if the function is safe under the stated assumptions.\n\nThe verifier checks a serialized DFA. Some states are encoded as differences from another state default table.\n\nCode:\n```c\n 1: static int verify_dfa_reduced(const struct dfa *d)\n 2: {\n 3:     for (uint32_t state = 0; state < d->state_count; state++) {\n 4:         uint32_t j = state;\n 5: \n 6:         if (d->default_table[j] >= d->state_count)\n 7:             return -EINVAL;\n 8: \n 9:         while (d->is_differential[j]) {\n10:             uint32_t parent = d->default_table[j];\n11:             j = parent;                    // parent not rechecked here\n12:         }\n13: \n14:         validate_accept_table(d->accept[j]);\n15:     }\n16:     return 0;\n17: }\n```",
+        .answer = "10-14",
+    },
 };
 
 typedef struct {
@@ -1044,6 +1194,8 @@ typedef struct {
     const char *model_path;
     const char *mtp_path;
     const char *trace_path;
+    const char *regrade_trace_path;
+    const char *case_sequence;
     ds4_backend backend;
     int threads;
     int ctx_size;
@@ -1051,15 +1203,26 @@ typedef struct {
     int question_limit;
     float temperature;
     float top_p;
+    float min_p;
     uint64_t seed;
     int pause_ms;
+    int power_percent;
+    uint32_t prefill_chunk;
+    uint32_t ssd_streaming_cache_experts;
+    uint64_t ssd_streaming_cache_bytes;
+    uint32_t ssd_streaming_preload_experts;
+    uint64_t simulate_used_memory_bytes;
     int soft_limit_reply_budget;
     int hard_limit_reply_budget;
     int soft_limit_think_close_rank;
     ds4_think_mode think_mode;
+    ds4_dist_options dist;
     bool plain;
     bool warm_weights;
     bool quality;
+    bool ssd_streaming;
+    bool ssd_streaming_cold;
+    bool self_test_extractors;
 } eval_config;
 
 typedef struct {
@@ -1088,6 +1251,7 @@ typedef struct {
     int active_case;
     int generated;
     int max_tokens;
+    int think_max_tokens;
     int prefill_current;
     int prefill_total;
     double phase_start_sec;
@@ -1099,6 +1263,7 @@ typedef struct {
     int selected_case;
     int requested_case;
     bool paused;
+    bool quit_requested;
     byte_buf stream;
     style_buf styles;
     bool in_think;
@@ -1159,6 +1324,7 @@ typedef struct {
     int move_delta;
     bool enter_pressed;
     bool pause_pressed;
+    bool quit_pressed;
 } eval_input;
 
 static eval_input global_input = {
@@ -1213,6 +1379,10 @@ static int eval_case_nchoices(const eval_case *tc) {
 
 static bool eval_case_is_multiple_choice(const eval_case *tc) {
     return eval_case_nchoices(tc) > 0;
+}
+
+static bool eval_case_is_compsec(const eval_case *tc) {
+    return tc->source && !strcmp(tc->source, "COMPSEC");
 }
 
 static void style_append(style_buf *b, unsigned char style, size_t n) {
@@ -1317,56 +1487,17 @@ static ds4_backend default_backend(void) {
 #endif
 }
 
-static void usage(FILE *fp) {
-    fprintf(fp,
-        "Usage: ds4-eval [options]\n"
-        "\n"
-        "Runs a small built-in GPQA Diamond/SuperGPQA/AIME2025 integration test.\n"
-        "The TTY UI keeps the question list on the left and streams sampled\n"
-        "tokens live on the right; thinking text is dim grey until </think>.\n"
-        "In the TTY UI, Up/Down selects a question, Enter runs it next,\n"
-        "and p pauses or resumes evaluation.\n"
-        "\n"
-        "Model and backend:\n"
-        "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
-        "  --mtp FILE             Optional MTP support GGUF.\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
-        "  -t, --threads N        CPU helper threads.\n"
-        "  --quality              Prefer exact kernels where applicable.\n"
-        "  --warm-weights         Touch mapped tensor pages before evaluation.\n"
-        "\n"
-        "Evaluation:\n"
-        "  -c, --ctx N            Context size. Default: 100000\n"
-        "  -n, --tokens N         Max generated tokens per question. Default: 16000\n"
-        "  --questions N          Run only the first N embedded questions.\n"
-        "  --temp F               Sampling temperature. Default: 0\n"
-        "  --top-p F              Nucleus sampling probability. Default: 1\n"
-        "  --seed N               Sampling seed. Default: time-based\n"
-        "  --trace FILE           Write questions, outputs, and grading decisions.\n"
-        "  --think                Enable thinking mode. Default\n"
-        "  --nothink              Disable thinking mode.\n"
-        "  --soft-limit-reply-budget N\n"
-        "                         Inside the last N tokens, close thinking if\n"
-        "                         </think> is already among the top close ranks.\n"
-        "                         Default: 1024\n"
-        "  --hard-limit-reply-budget N\n"
-        "                         Force </think> with N tokens left for the answer.\n"
-        "                         Default: 512\n"
-        "  --soft-limit-think-close-rank N\n"
-        "                         Soft-close when </think> is in the top N tokens.\n"
-        "                         Default: 3\n"
-        "  --pause-ms N           Pause after each result in the TTY UI. Default: 350\n"
-        "  --plain                Disable split-screen ANSI UI.\n"
-        "  -h, --help             Show this help.\n");
+static void usage(FILE *fp, const char *topic) {
+    ds4_help_print(fp, DS4_HELP_EVAL, topic);
 }
 
 static eval_config parse_options(int argc, char **argv) {
     eval_config c = {
         .model_path = "ds4flash.gguf",
         .backend = default_backend(),
-        .ctx_size = 100000,
         .max_tokens = 16000,
-        .top_p = 1.0f,
+        .top_p = DS4_DEFAULT_TOP_P,
+        .min_p = DS4_DEFAULT_MIN_P,
         .pause_ms = 350,
         .soft_limit_reply_budget = 1024,
         .hard_limit_reply_budget = 512,
@@ -1377,9 +1508,29 @@ static eval_config parse_options(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-            usage(stdout);
+            const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                argv[i + 1] : NULL;
+            usage(stdout, topic);
             exit(0);
-        } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
+        }
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg,
+                                   &i,
+                                   argc,
+                                   argv,
+                                   &c.dist,
+                                   dist_parse_err,
+                                   sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-eval: %s\n",
+                    dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+            exit(2);
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
@@ -1389,14 +1540,20 @@ static eval_config parse_options(int argc, char **argv) {
             c.max_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--questions")) {
             c.question_limit = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--case-sequence")) {
+            c.case_sequence = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--temp")) {
             c.temperature = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
         } else if (!strcmp(arg, "--top-p")) {
             c.top_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+        } else if (!strcmp(arg, "--min-p")) {
+            c.min_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--seed")) {
             c.seed = parse_u64_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--regrade-trace")) {
+            c.regrade_trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--soft-limit-reply-budget")) {
             c.soft_limit_reply_budget = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--hard-limit-reply-budget")) {
@@ -1417,27 +1574,99 @@ static eval_config parse_options(int argc, char **argv) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;
+        } else if (!strcmp(arg, "--ssd-streaming")) {
+            c.ssd_streaming = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
+            c.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            uint32_t experts = 0;
+            uint64_t bytes = 0;
+            if (!ds4_parse_streaming_cache_experts_arg(
+                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {
+                fprintf(stderr,
+                        "ds4-eval: --ssd-streaming-cache-experts must be a positive count or <number>GB\n");
+                exit(2);
+            }
+            c.ssd_streaming_cache_experts = experts;
+            c.ssd_streaming_cache_bytes = bytes;
+        } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
+            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                fprintf(stderr, "ds4-eval: --ssd-streaming-preload-experts must be positive\n");
+                exit(2);
+            }
+            c.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--simulate-used-memory")) {
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
+                                   &c.simulate_used_memory_bytes)) {
+                fprintf(stderr,
+                        "ds4-eval: --simulate-used-memory must be a positive GiB value, e.g. 64GB\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--prefill-chunk")) {
+            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                fprintf(stderr, "ds4-eval: --prefill-chunk must be positive\n");
+                exit(2);
+            }
+            c.prefill_chunk = (uint32_t)v;
+        } else if (!strcmp(arg, "--power")) {
+            c.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.power_percent < 1 || c.power_percent > 100) {
+                fprintf(stderr, "ds4-eval: --power must be between 1 and 100\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
         } else if (!strcmp(arg, "--think")) {
             c.think_mode = DS4_THINK_HIGH;
+        } else if (!strcmp(arg, "--think-max")) {
+            c.think_mode = DS4_THINK_MAX;
         } else if (!strcmp(arg, "--nothink")) {
             c.think_mode = DS4_THINK_NONE;
         } else if (!strcmp(arg, "--plain")) {
             c.plain = true;
+        } else if (!strcmp(arg, "--self-test-extractors")) {
+            c.self_test_extractors = true;
         } else {
             fprintf(stderr, "ds4-eval: unknown option: %s\n", arg);
-            usage(stderr);
+            usage(stderr, NULL);
             exit(2);
         }
     }
-    if (c.hard_limit_reply_budget >= c.max_tokens) {
+    if (c.self_test_extractors || c.regrade_trace_path) return c;
+
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-eval: %s\n", dist_err);
+        exit(2);
+    }
+    if (c.dist.role == DS4_DISTRIBUTED_WORKER) {
+        fprintf(stderr, "ds4-eval: --role worker is a serving mode; start workers with ./ds4\n");
+        exit(2);
+    }
+
+    if (c.max_tokens > EVAL_MAX_CONTEXT) {
+        fprintf(stderr,
+                "ds4-eval: --tokens (%d) exceeds the %d token context cap\n",
+                c.max_tokens, EVAL_MAX_CONTEXT);
+        exit(2);
+    }
+    if (c.ctx_size > EVAL_MAX_CONTEXT) {
+        fprintf(stderr,
+                "ds4-eval: --ctx (%d) exceeds the %d token context cap\n",
+                c.ctx_size, EVAL_MAX_CONTEXT);
+        exit(2);
+    }
+    if (ds4_think_mode_enabled(c.think_mode) &&
+        c.hard_limit_reply_budget >= c.max_tokens) {
         fprintf(stderr,
                 "ds4-eval: --hard-limit-reply-budget (%d) must be smaller than --tokens (%d)\n",
                 c.hard_limit_reply_budget, c.max_tokens);
         exit(2);
     }
-    if (c.soft_limit_reply_budget < c.hard_limit_reply_budget) {
+    if (ds4_think_mode_enabled(c.think_mode) &&
+        c.soft_limit_reply_budget < c.hard_limit_reply_budget) {
         fprintf(stderr,
                 "ds4-eval: --soft-limit-reply-budget (%d) must be >= --hard-limit-reply-budget (%d)\n",
                 c.soft_limit_reply_budget, c.hard_limit_reply_budget);
@@ -1486,6 +1715,8 @@ static void term_set_color_for_status(eval_status st) {
     case EVAL_PENDING:  fputs(ANSI_DIM, stdout); break;
     case EVAL_PREFILL:  fputs(ANSI_CYAN, stdout); break;
     case EVAL_THINKING: fputs(ANSI_YELLOW, stdout); break;
+    case EVAL_SKIPPED:  fputs(ANSI_DIM, stdout); break;
+    case EVAL_STOPPED:  fputs(ANSI_YELLOW ANSI_BOLD, stdout); break;
     case EVAL_PASSED:   fputs(ANSI_GREEN ANSI_BOLD, stdout); break;
     case EVAL_FAILED:   fputs(ANSI_RED ANSI_BOLD, stdout); break;
     }
@@ -1496,6 +1727,8 @@ static const char *status_name(eval_status st) {
     case EVAL_PENDING: return "PEND";
     case EVAL_PREFILL: return "FILL";
     case EVAL_THINKING: return "RUN";
+    case EVAL_SKIPPED: return "SKIP";
+    case EVAL_STOPPED: return "STOP";
     case EVAL_PASSED: return "PASS";
     case EVAL_FAILED: return "FAIL";
     }
@@ -1571,6 +1804,8 @@ static void input_queue_key(int key) {
         global_input.enter_pressed = true;
     } else if (key == 'p' || key == 'P') {
         global_input.pause_pressed = true;
+    } else if (key == 'q' || key == 'Q') {
+        global_input.quit_pressed = true;
     }
     pthread_mutex_unlock(&global_input.mu);
 }
@@ -1590,7 +1825,7 @@ static void *input_thread_main(void *arg) {
             unsigned char c = (unsigned char)buf[i];
             if (esc_state == 0) {
                 if (c == 27) esc_state = 1;
-                else if (c == 'p' || c == 'P') input_queue_key(c);
+                else if (c == 'p' || c == 'P' || c == 'q' || c == 'Q') input_queue_key(c);
                 else if (c == '\r' || c == '\n') input_queue_key(c);
             } else if (esc_state == 1) {
                 esc_state = (c == '[' || c == 'O') ? 2 : 0;
@@ -1608,9 +1843,10 @@ static void tui_start_input(void) {
     if (tcgetattr(STDIN_FILENO, &global_input.orig_termios) != 0) return;
 
     /* The input thread is intentionally boring: it never writes to the terminal,
-     * it only queues arrow/Enter state.  Rendering remains owned by the main
-     * thread and follows the same full-frame redraw path as the noninteractive
-     * UI. Keep ISIG set so Ctrl-C still restores the alternate screen. */
+     * it only queues navigation/control state.  Rendering remains owned by the
+     * main thread and follows the same full-frame redraw path as the
+     * noninteractive UI. Keep ISIG set so Ctrl-C still restores the alternate
+     * screen. */
     struct termios raw = global_input.orig_termios;
     raw.c_lflag &= ~(ICANON | ECHO);
     raw.c_cc[VMIN] = 0;
@@ -1621,6 +1857,7 @@ static void tui_start_input(void) {
     global_input.move_delta = 0;
     global_input.enter_pressed = false;
     global_input.pause_pressed = false;
+    global_input.quit_pressed = false;
     pthread_mutex_unlock(&global_input.mu);
 
     global_input.raw_mode = true;
@@ -1656,10 +1893,18 @@ static void tui_consume_input(eval_ui *ui) {
     int move = global_input.move_delta;
     bool enter = global_input.enter_pressed;
     bool pause = global_input.pause_pressed;
+    bool quit = global_input.quit_pressed;
     global_input.move_delta = 0;
     global_input.enter_pressed = false;
     global_input.pause_pressed = false;
+    global_input.quit_pressed = false;
     pthread_mutex_unlock(&global_input.mu);
+
+    if (quit) {
+        ui->quit_requested = true;
+        ui->paused = false;
+        return;
+    }
 
     if (pause) ui->paused = !ui->paused;
 
@@ -1709,7 +1954,7 @@ static void tui_signal_restore(int sig) {
     }
     if (ui && ui->active) {
         const char restore[] = ANSI_RESET "\x1b[?25h\x1b[?1049l";
-        (void)write(STDOUT_FILENO, restore, sizeof(restore) - 1);
+        if (write(STDOUT_FILENO, restore, sizeof(restore) - 1) == -1) {}
         ui->active = false;
     }
     signal(sig, SIG_DFL);
@@ -1721,7 +1966,7 @@ static void tui_draw_title(eval_ui *ui) {
     tui_clear_left_line(ui, 1);
     char elapsed[32];
     format_run_elapsed(elapsed, sizeof(elapsed), tui_run_clock_visible_sec(ui));
-    fputs(ANSI_BOLD "ds4-eval" ANSI_RESET, stdout);
+    fputs("ds4-eval (" ANSI_BOLD "p" ANSI_RESET ")ause (" ANSI_BOLD "q" ANSI_RESET ")uit", stdout);
     printf(" %s", elapsed);
     if (ui->paused) {
         fputs(" " ANSI_RED ANSI_BOLD "PAUSED" ANSI_RESET, stdout);
@@ -1787,7 +2032,9 @@ static void tui_draw_left(eval_ui *ui) {
         printf("%-4s", status_name(ui->status[i]));
         fputs(ANSI_RESET, stdout);
 
-        int title_w = ui->left_w - 22;
+        const int answer_w = 18;
+        const int answer_col = ui->left_w - answer_w + 1;
+        int title_w = answer_col - 11;
         if (title_w > 0) {
             fputc(' ', stdout);
             char title[512];
@@ -1796,9 +2043,12 @@ static void tui_draw_left(eval_ui *ui) {
             print_trimmed(title, title_w);
         }
         if (ui->status[i] == EVAL_FAILED || ui->status[i] == EVAL_PASSED) {
-            term_move(screen_row, ui->left_w - 10);
-            printf(" %.3s/%.3s", ui->guess[i][0] ? ui->guess[i] : "?",
-                   ui->cases[i].answer);
+            char answers[64];
+            snprintf(answers, sizeof(answers), "%s/%s",
+                     ui->guess[i][0] ? ui->guess[i] : "?",
+                     ui->cases[i].answer);
+            term_move(screen_row, answer_col);
+            print_trimmed(answers, answer_w);
         }
         fputs(ANSI_RESET, stdout);
     }
@@ -2000,8 +2250,12 @@ static void tui_draw_right_status(eval_ui *ui, const char *phase) {
                  ui->speed_tps, short_phase_name(phase), cur, total, pct,
                  tc->source, id);
     } else {
-        format_short_count(gen, sizeof(gen), ui->generated);
-        format_short_count(max, sizeof(max), ui->max_tokens);
+        int phase_max = !strcmp(phase, "thinking") ? ui->think_max_tokens : ui->max_tokens;
+        int phase_gen = ui->generated;
+        if (phase_max < 0) phase_max = 0;
+        if (!strcmp(phase, "thinking") && phase_gen > phase_max) phase_gen = phase_max;
+        format_short_count(gen, sizeof(gen), phase_gen);
+        format_short_count(max, sizeof(max), phase_max);
         snprintf(line, sizeof(line),
                  "Speed %.2f t/s  %s %s/%s  %s/%s",
                  ui->speed_tps, short_phase_name(phase), gen, max,
@@ -2027,6 +2281,7 @@ static void tui_start(eval_ui *ui, const eval_case *cases, int ncases, int max_t
     ui->max_tokens = max_tokens;
     ui->selected_case = 0;
     ui->requested_case = -1;
+    ui->quit_requested = false;
     ui->status = calloc((size_t)ncases, sizeof(*ui->status));
     ui->guess = calloc((size_t)ncases, sizeof(*ui->guess));
     ui->prompt_tokens = calloc((size_t)ncases, sizeof(*ui->prompt_tokens));
@@ -2087,6 +2342,11 @@ static void plain_reset_color(bool use_color) {
     if (use_color) fputs(ANSI_RESET, stdout);
 }
 
+static const char *eval_system_prompt(void) {
+    return "You are solving a hard benchmark question. Reason carefully. "
+           "The final answer must follow the requested format exactly.";
+}
+
 static char *build_question_prompt(const eval_case *tc) {
     byte_buf b = {0};
     int nchoices = eval_case_nchoices(tc);
@@ -2103,6 +2363,14 @@ static char *build_question_prompt(const eval_case *tc) {
             strlen("\nSolve the question. At the end, write exactly one final line in this "
                    "format and do not write anything after it:\n"
                    "Answer: <letter>"));
+    } else if (eval_case_is_compsec(tc)) {
+        buf_append(&b,
+            "\nAt the end, write exactly one final line in this format and do not "
+            "write anything after it:\n"
+            "Answer: <line number or comma-separated line numbers>",
+            strlen("\nAt the end, write exactly one final line in this format and do not "
+                   "write anything after it:\n"
+                   "Answer: <line number or comma-separated line numbers>"));
     } else {
         buf_append(&b,
             "\nSolve the problem. At the end, write exactly one final line in this "
@@ -2118,9 +2386,110 @@ static char *build_question_prompt(const eval_case *tc) {
     return empty;
 }
 
+static int eval_max_prompt_tokens(ds4_engine *engine,
+                                  const eval_config *cfg,
+                                  const eval_case *cases,
+                                  int ncases,
+                                  int ctx_for_think_mode,
+                                  int *max_case_out)
+{
+    int max_prompt = 0;
+    int max_case = -1;
+    const ds4_think_mode think_mode =
+        ds4_think_mode_for_context(cfg->think_mode, ctx_for_think_mode);
+
+    for (int i = 0; i < ncases; i++) {
+        char *question = build_question_prompt(&cases[i]);
+        if (!question) {
+            fprintf(stderr, "ds4-eval: failed to allocate prompt\n");
+            exit(1);
+        }
+        ds4_tokens prompt = {0};
+        ds4_encode_chat_prompt(engine, eval_system_prompt(), question, think_mode, &prompt);
+        if (prompt.len > max_prompt) {
+            max_prompt = prompt.len;
+            max_case = i;
+        }
+        ds4_tokens_free(&prompt);
+        free(question);
+    }
+    if (max_case_out) *max_case_out = max_case;
+    return max_prompt;
+}
+
+static int eval_auto_context_size(ds4_engine *engine,
+                                  eval_config *cfg,
+                                  const eval_case *cases,
+                                  int ncases,
+                                  int *max_prompt_out,
+                                  int *max_case_out)
+{
+    int ctx = EVAL_MAX_CONTEXT;
+    int max_prompt = 0;
+    int max_case = -1;
+    const int min_ctx = cfg->think_mode == DS4_THINK_MAX ?
+                        (int)ds4_think_max_min_context() : 1;
+
+    /* Think Max downgrades to normal thinking under its minimum context.  Size
+     * the prompts iteratively so the prompt tokenizer sees the same effective
+     * thinking mode that the actual run will use. */
+    for (int iter = 0; iter < 3; iter++) {
+        max_prompt = eval_max_prompt_tokens(engine, cfg, cases, ncases, ctx, &max_case);
+        long long required = (long long)max_prompt + (long long)cfg->max_tokens;
+        if (required < min_ctx) required = min_ctx;
+        if (required > EVAL_MAX_CONTEXT) {
+            fprintf(stderr,
+                    "ds4-eval: largest prompt (%d tokens, case %d) + --tokens (%d) exceeds the %d token context cap\n",
+                    max_prompt, max_case + 1, cfg->max_tokens, EVAL_MAX_CONTEXT);
+            exit(2);
+        }
+        if ((int)required == ctx) break;
+        ctx = (int)required;
+    }
+
+    if (max_prompt_out) *max_prompt_out = max_prompt;
+    if (max_case_out) *max_case_out = max_case;
+    return ctx;
+}
+
+static void eval_warn_think_max_downgraded(const eval_config *cfg) {
+    if (cfg->think_mode != DS4_THINK_MAX ||
+        ds4_think_mode_for_context(cfg->think_mode, cfg->ctx_size) == DS4_THINK_MAX) {
+        return;
+    }
+    fprintf(stderr,
+            "ds4-eval: warning: --think-max needs --ctx >= %u; ctx=%d uses normal thinking instead\n",
+            ds4_think_max_min_context(),
+            cfg->ctx_size);
+}
+
+static void eval_warn_context_budget(const eval_config *cfg, int max_prompt_tokens, int max_prompt_case) {
+    if (max_prompt_tokens >= cfg->ctx_size) {
+        fprintf(stderr,
+                "ds4-eval: warning: largest prompt (%d tokens, case=%d) does not fit ctx=%d\n",
+                max_prompt_tokens,
+                max_prompt_case + 1,
+                cfg->ctx_size);
+        return;
+    }
+
+    const int room = cfg->ctx_size - max_prompt_tokens;
+    if (room < cfg->max_tokens) {
+        fprintf(stderr,
+                "ds4-eval: warning: largest prompt (%d tokens, case=%d) leaves %d generation tokens in ctx=%d; requested %d\n",
+                max_prompt_tokens,
+                max_prompt_case + 1,
+                room,
+                cfg->ctx_size,
+                cfg->max_tokens);
+    }
+}
+
 static void trace_write_block(FILE *trace, const char *label, const char *text) {
     if (!trace) return;
     size_t len = text ? strlen(text) : 0;
+    /* Counted blocks make regrading robust against model output that happens
+     * to contain trace-looking delimiters or embedded CASE headers. */
     fprintf(trace, "%s_BEGIN bytes=%zu\n", label, len);
     if (len) {
         fwrite(text, 1, len, trace);
@@ -2155,18 +2524,24 @@ static int token_rank_in_top(ds4_session *session, int token, int max_rank) {
     return rank;
 }
 
-static void trace_write_header(FILE *trace, const eval_config *cfg, int ncases) {
+static void trace_write_header(FILE *trace, const eval_config *cfg,
+                               const char *model_name,
+                               int ncases,
+                               int max_prompt_tokens) {
     if (!trace) return;
     fprintf(trace,
             "# ds4-eval trace\n"
             "started_unix: %lld\n"
             "model: %s\n"
+            "model_shape: %s\n"
             "backend: %s\n"
             "ctx: %d\n"
             "max_tokens: %d\n"
+            "max_prompt_tokens: %d\n"
             "questions: %d\n"
             "temperature: %.6g\n"
             "top_p: %.6g\n"
+            "min_p: %.6g\n"
             "seed: %llu\n"
             "think_mode_requested: %s\n"
             "soft_limit_reply_budget: %d\n"
@@ -2175,12 +2550,15 @@ static void trace_write_header(FILE *trace, const eval_config *cfg, int ncases) 
             "\n",
             (long long)time(NULL),
             cfg->model_path,
+            model_name ? model_name : "unknown",
             ds4_backend_name(cfg->backend),
             cfg->ctx_size,
             cfg->max_tokens,
+            max_prompt_tokens,
             ncases,
             cfg->temperature,
             cfg->top_p,
+            cfg->min_p,
             (unsigned long long)cfg->seed,
             ds4_think_mode_name(cfg->think_mode),
             cfg->soft_limit_reply_budget,
@@ -2222,6 +2600,7 @@ static void trace_write_case(FILE *trace,
             "elapsed_sec: %.3f\n"
             "temperature: %.6g\n"
             "top_p: %.6g\n"
+            "min_p: %.6g\n"
             "think_mode_effective: %s\n",
             idx + 1, ncases, tc->source, tc->id,
             (long long)time(NULL),
@@ -2237,6 +2616,7 @@ static void trace_write_case(FILE *trace,
             elapsed_sec,
             cfg->temperature,
             cfg->top_p,
+            cfg->min_p,
             ds4_think_mode_name(effective_think_mode));
     if (think_close && think_close->kind != EVAL_THINK_CLOSE_NONE) {
         fprintf(trace,
@@ -2268,6 +2648,9 @@ static void trace_write_case(FILE *trace,
     fflush(trace);
 }
 
+/* Model outputs can contain provisional "answer" text after a forced
+ * </think> and then a later final line.  A strict final Answer: marker is the
+ * best grading target; outputs without one keep the original loose fallback. */
 static char *strcasestr_local(const char *hay, const char *needle) {
     size_t nlen = strlen(needle);
     if (nlen == 0) return (char *)hay;
@@ -2283,13 +2666,31 @@ static bool is_letter_boundary(char before, char after) {
     return !isalpha((unsigned char)before) && !isalpha((unsigned char)after);
 }
 
+static char *find_last_answer_marker(const char *visible) {
+    char *last = NULL;
+    const size_t nlen = strlen("answer");
+
+    for (const char *p = visible; *p; p++) {
+        if (tolower((unsigned char)*p) != 'a' || strncasecmp(p, "answer", nlen) != 0)
+            continue;
+        char before = p == visible ? ' ' : p[-1];
+        char after = p[nlen];
+        if (!is_letter_boundary(before, after)) continue;
+
+        const char *q = p + nlen;
+        while (*q && isspace((unsigned char)*q)) q++;
+        if (*q == ':') last = (char *)p;
+    }
+    return last ? last : strcasestr_local(visible, "answer");
+}
+
 static char find_answer_letter(const char *generated, int nchoices) {
     if (nchoices <= 0) return '?';
     const char *visible = strstr(generated, "</think>");
     visible = visible ? visible + 8 : generated;
     char max_answer = (char)('A' + nchoices - 1);
 
-    char *answer = strcasestr_local(visible, "answer");
+    char *answer = find_last_answer_marker(visible);
     if (answer) {
         const char *end = answer + strlen(answer);
         if (strlen(answer) > 96) end = answer + 96;
@@ -2347,7 +2748,7 @@ static void find_integer_answer(const char *generated, char *dst, size_t dstlen)
     const char *visible = strstr(generated, "</think>");
     visible = visible ? visible + 8 : generated;
 
-    char *answer = strcasestr_local(visible, "answer");
+    char *answer = find_last_answer_marker(visible);
     if (answer) {
         const char *end = answer + strlen(answer);
         if (strlen(answer) > 160) end = answer + 160;
@@ -2371,12 +2772,122 @@ static void find_integer_answer(const char *generated, char *dst, size_t dstlen)
     }
 }
 
+static void normalize_compsec_line_spec(const char *p, const char *end,
+                                        char *dst, size_t dstlen) {
+    if (dstlen == 0) return;
+    size_t n = 0;
+
+    /* The model is instructed to finish with:
+     *
+     *     Answer: <line number or comma-separated line numbers>
+     *
+     * We still accept harmless surface variants in that final line: "line 9",
+     * "9 and 15", "9, 15", or "20-22".  The hidden key decides what set of
+     * exact line numbers is acceptable; this routine only normalizes the model
+     * text into the same compact line-spec syntax.
+     */
+    for (; p < end && *p; p++) {
+        if (!isdigit((unsigned char)*p)) continue;
+
+        if (n > 0 && n + 1 < dstlen) dst[n++] = ',';
+        while (p < end && isdigit((unsigned char)*p)) {
+            if (n + 1 < dstlen) dst[n++] = *p;
+            p++;
+        }
+        while (p < end && isspace((unsigned char)*p)) p++;
+
+        if (p < end && *p == '-') {
+            if (n + 1 < dstlen) dst[n++] = '-';
+            p++;
+            while (p < end && isspace((unsigned char)*p)) p++;
+            while (p < end && isdigit((unsigned char)*p)) {
+                if (n + 1 < dstlen) dst[n++] = *p;
+                p++;
+            }
+        }
+        if (p >= end || !*p) break;
+    }
+    while (n > 0 && (dst[n - 1] == ',' || dst[n - 1] == '-')) n--;
+    dst[n] = '\0';
+    if (n == 0) snprintf(dst, dstlen, "?");
+}
+
+static void find_compsec_answer(const char *generated, char *dst, size_t dstlen) {
+    if (dstlen == 0) return;
+    snprintf(dst, dstlen, "?");
+    const char *visible = strstr(generated, "</think>");
+    visible = visible ? visible + 8 : generated;
+
+    char *answer = find_last_answer_marker(visible);
+    if (answer) {
+        const char *end = answer + strlen(answer);
+        if (strlen(answer) > 160) end = answer + 160;
+        const char *newline = memchr(answer, '\n', (size_t)(end - answer));
+        if (newline) end = newline;
+        normalize_compsec_line_spec(answer, end, dst, dstlen);
+        if (strcmp(dst, "?") != 0) return;
+    }
+    find_integer_answer(generated, dst, dstlen);
+}
+
+static bool parse_line_spec(const char *spec, bool *set, size_t setlen) {
+    bool any = false;
+    const char *p = spec;
+    while (p && *p) {
+        while (*p && !isdigit((unsigned char)*p)) p++;
+        if (!*p) break;
+        char *end = NULL;
+        long a = strtol(p, &end, 10);
+        long b = a;
+        p = end;
+        if (*p == '-') {
+            p++;
+            b = strtol(p, &end, 10);
+            p = end;
+        }
+        if (a > b) {
+            long tmp = a;
+            a = b;
+            b = tmp;
+        }
+        if (a < 0) a = 0;
+        if (b >= (long)setlen) b = (long)setlen - 1;
+        for (long i = a; i <= b; i++) {
+            set[i] = true;
+            any = true;
+        }
+    }
+    return any;
+}
+
+static bool compsec_answer_matches(const char *expected_spec, const char *got_spec) {
+    bool expected[256] = {0};
+    bool got[256] = {0};
+    if (!parse_line_spec(expected_spec, expected, sizeof(expected))) return false;
+    if (!parse_line_spec(got_spec, got, sizeof(got))) return false;
+
+    bool hit = false;
+    for (size_t i = 0; i < sizeof(got); i++) {
+        if (!got[i]) continue;
+        if (!expected[i]) return false;
+        hit = true;
+    }
+    /* The prompt asks the model for the single best line, or the smallest exact
+     * set when the bug cannot be localized to one line.  The hidden expected
+     * answer may be a small audited range when adjacent lines are equivalent
+     * locations for the same bug.  Any model-supplied line must be inside that
+     * accepted set, and at least one accepted line must be present. */
+    return hit;
+}
+
 static void find_case_answer(const eval_case *tc, const char *generated,
                              char *dst, size_t dstlen) {
     if (dstlen == 0) return;
     if (eval_case_is_multiple_choice(tc)) {
         dst[0] = find_answer_letter(generated, eval_case_nchoices(tc));
         if (dstlen > 1) dst[1] = '\0';
+    } else if (eval_case_is_compsec(tc)) {
+        find_compsec_answer(generated, dst, dstlen);
     } else {
         find_integer_answer(generated, dst, dstlen);
     }
@@ -2386,9 +2897,436 @@ static bool answer_matches(const eval_case *tc, const char *got) {
     if (eval_case_is_multiple_choice(tc)) {
         return got && got[0] && tc->answer && got[0] == tc->answer[0];
     }
+    if (eval_case_is_compsec(tc)) {
+        return got && tc->answer && compsec_answer_matches(tc->answer, got);
+    }
     char expected[EVAL_ANSWER_MAX];
     normalize_integer_answer(tc->answer, strlen(tc->answer), expected, sizeof(expected));
     return got && strcmp(got, expected) == 0;
+}
+
+static char *read_text_file(const char *path, size_t *len_out) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "ds4-eval: cannot open trace '%s': %s\n",
+                path, strerror(errno));
+        return NULL;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fprintf(stderr, "ds4-eval: cannot seek trace '%s': %s\n",
+                path, strerror(errno));
+        fclose(fp);
+        return NULL;
+    }
+    long len_long = ftell(fp);
+    if (len_long < 0) {
+        fprintf(stderr, "ds4-eval: cannot tell trace size '%s': %s\n",
+                path, strerror(errno));
+        fclose(fp);
+        return NULL;
+    }
+    rewind(fp);
+
+    size_t len = (size_t)len_long;
+    char *buf = malloc(len + 1);
+    if (!buf) {
+        fprintf(stderr, "ds4-eval: out of memory\n");
+        fclose(fp);
+        return NULL;
+    }
+    if (len && fread(buf, 1, len, fp) != len) {
+        fprintf(stderr, "ds4-eval: cannot read trace '%s': %s\n",
+                path, ferror(fp) ? strerror(errno) : "short read");
+        free(buf);
+        fclose(fp);
+        return NULL;
+    }
+    fclose(fp);
+    buf[len] = '\0';
+    if (len_out) *len_out = len;
+    return buf;
+}
+
+static const char *bounded_strstr(const char *start, const char *end,
+                                  const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0) return start;
+    if ((size_t)(end - start) < nlen) return NULL;
+    for (const char *p = start; p + nlen <= end; p++) {
+        if (!memcmp(p, needle, nlen)) return p;
+    }
+    return NULL;
+}
+
+static void copy_span(char *dst, size_t dstlen, const char *start, const char *end) {
+    if (dstlen == 0) return;
+    while (end > start && (end[-1] == '\r' || end[-1] == '\n')) end--;
+    size_t n = (size_t)(end - start);
+    if (n >= dstlen) n = dstlen - 1;
+    memcpy(dst, start, n);
+    dst[n] = '\0';
+}
+
+static const char *trace_skip_counted_block(const char *line,
+                                            const char *line_end,
+                                            const char *end) {
+    /*
+     * Trace regrading must scan metadata lines without being confused by model
+     * output.  Prefer the byte count written by trace_write_block(); the older
+     * delimiter-only parser is still accepted in trace_copy_model_output for
+     * compatibility with existing trace files.
+     */
+    const char *begin = bounded_strstr(line, line_end, "_BEGIN bytes=");
+    if (!begin || begin == line) return NULL;
+
+    size_t label_len = (size_t)(begin - line);
+    if (label_len > 96) return NULL;
+
+    char end_marker[128];
+    int marker_len = snprintf(end_marker, sizeof(end_marker), "%.*s_END",
+                              (int)label_len, line);
+    if (marker_len <= 0 || (size_t)marker_len >= sizeof(end_marker)) return NULL;
+
+    const char *bytes = begin + strlen("_BEGIN bytes=");
+    char *endptr = NULL;
+    unsigned long long declared = strtoull(bytes, &endptr, 10);
+    if (endptr == bytes || endptr > line_end) return NULL;
+
+    const char *content = line_end < end ? line_end + 1 : end;
+    if (declared > (unsigned long long)(end - content)) return NULL;
+
+    const char *marker = content + (size_t)declared;
+    if (marker < end && *marker == '\n') marker++;
+    if ((size_t)(end - marker) < (size_t)marker_len ||
+        memcmp(marker, end_marker, (size_t)marker_len) != 0)
+        return NULL;
+
+    const char *after_marker = marker + marker_len;
+    const char *after_line = memchr(after_marker, '\n', (size_t)(end - after_marker));
+    return after_line ? after_line + 1 : end;
+}
+
+static const char *trace_find_next_case(const char *start, const char *end) {
+    const char *p = start;
+    while (p < end) {
+        const char *line_end = memchr(p, '\n', (size_t)(end - p));
+        if (!line_end) line_end = end;
+
+        const char *skip = trace_skip_counted_block(p, line_end, end);
+        if (skip && skip > p) {
+            p = skip;
+            continue;
+        }
+
+        const char *case_marker = "===== CASE ";
+        size_t marker_len = strlen(case_marker);
+        if ((size_t)(line_end - p) >= marker_len &&
+            !memcmp(p, case_marker, marker_len))
+            return p;
+
+        p = line_end < end ? line_end + 1 : end;
+    }
+    return NULL;
+}
+
+static const char *trace_find_block_begin(const char *start, const char *end,
+                                          const char *label) {
+    size_t label_len = strlen(label);
+    const char *p = start;
+    while (p < end) {
+        const char *line_end = memchr(p, '\n', (size_t)(end - p));
+        if (!line_end) line_end = end;
+
+        if ((size_t)(line_end - p) >= label_len &&
+            !memcmp(p, label, label_len))
+            return p;
+
+        const char *skip = trace_skip_counted_block(p, line_end, end);
+        if (skip && skip > p) {
+            p = skip;
+            continue;
+        }
+
+        p = line_end < end ? line_end + 1 : end;
+    }
+    return NULL;
+}
+
+static bool trace_get_line_field(const char *start, const char *end,
+                                 const char *key, char *dst, size_t dstlen) {
+    size_t keylen = strlen(key);
+    if (dstlen > 0) dst[0] = '\0';
+
+    const char *p = start;
+    while (p < end) {
+        const char *line_end = memchr(p, '\n', (size_t)(end - p));
+        if (!line_end) line_end = end;
+        if ((size_t)(line_end - p) >= keylen && !memcmp(p, key, keylen)) {
+            copy_span(dst, dstlen, p + keylen, line_end);
+            return true;
+        }
+        p = line_end < end ? line_end + 1 : end;
+    }
+    return false;
+}
+
+static const eval_case *find_eval_case_by_source_id(const char *source,
+                                                    const char *id) {
+    size_t ncases = sizeof(eval_cases) / sizeof(eval_cases[0]);
+    for (size_t i = 0; i < ncases; i++) {
+        if (eval_cases[i].source && eval_cases[i].id &&
+            !strcmp(eval_cases[i].source, source) &&
+            !strcmp(eval_cases[i].id, id))
+            return &eval_cases[i];
+    }
+    return NULL;
+}
+
+static char *trace_copy_model_output(const char *case_start, const char *case_end) {
+    const char *begin = trace_find_block_begin(case_start, case_end, "MODEL_OUTPUT_BEGIN");
+    if (!begin) return NULL;
+    const char *line_end = memchr(begin, '\n', (size_t)(case_end - begin));
+    if (!line_end) return NULL;
+    const char *content = line_end + 1;
+
+    size_t len = 0;
+    const char *bytes = bounded_strstr(begin, line_end, "bytes=");
+    if (bytes) {
+        char *endptr = NULL;
+        unsigned long long declared = strtoull(bytes + 6, &endptr, 10);
+        if (endptr == bytes + 6 || endptr > line_end ||
+            declared > (unsigned long long)(case_end - content))
+            return NULL;
+        len = (size_t)declared;
+        const char *marker = content + len;
+        if (marker < case_end && *marker == '\n') marker++;
+        if ((size_t)(case_end - marker) < strlen("MODEL_OUTPUT_END") ||
+            memcmp(marker, "MODEL_OUTPUT_END", strlen("MODEL_OUTPUT_END")) != 0)
+            return NULL;
+    } else {
+        const char *finish = bounded_strstr(content, case_end, "\nMODEL_OUTPUT_END");
+        if (!finish) return NULL;
+        len = (size_t)(finish - content);
+    }
+
+    char *out = malloc(len + 1);
+    if (!out) {
+        fprintf(stderr, "ds4-eval: out of memory\n");
+        return NULL;
+    }
+    memcpy(out, content, len);
+    out[len] = '\0';
+    return out;
+}
+
+static int regrade_trace_file(const char *path) {
+    size_t len = 0;
+    char *text = read_text_file(path, &len);
+    if (!text) return 2;
+
+    const char *start = text;
+    const char *end = text + len;
+    int total = 0;
+    int passed = 0;
+    int failed = 0;
+    int changed = 0;
+    int unknown = 0;
+    int parse_errors = 0;
+
+    while (true) {
+        const char *case_start = trace_find_next_case(start, end);
+        if (!case_start) break;
+        const char *after_header = memchr(case_start, '\n', (size_t)(end - case_start));
+        after_header = after_header ? after_header + 1 : end;
+        const char *case_end = trace_find_next_case(after_header, end);
+        if (!case_end) case_end = end;
+        start = case_end;
+        total++;
+
+        char source[64];
+        char id[128];
+        char traced_status[32];
+        char traced_pick[EVAL_ANSWER_MAX];
+        if (!trace_get_line_field(case_start, case_end, "source: ", source, sizeof(source)) ||
+            !trace_get_line_field(case_start, case_end, "id: ", id, sizeof(id))) {
+            fprintf(stderr, "ds4-eval: trace case %d is missing source/id\n", total);
+            parse_errors++;
+            continue;
+        }
+        trace_get_line_field(case_start, case_end, "status: ", traced_status, sizeof(traced_status));
+        trace_get_line_field(case_start, case_end, "picked: ", traced_pick, sizeof(traced_pick));
+
+        const eval_case *tc = find_eval_case_by_source_id(source, id);
+        if (!tc) {
+            fprintf(stderr, "ds4-eval: trace case %d not found in embedded cases: %s/%s\n",
+                    total, source, id);
+            unknown++;
+            continue;
+        }
+
+        char *model_output = trace_copy_model_output(case_start, case_end);
+        if (!model_output) {
+            fprintf(stderr, "ds4-eval: trace case %d is missing MODEL_OUTPUT block: %s/%s\n",
+                    total, source, id);
+            parse_errors++;
+            continue;
+        }
+
+        char got[EVAL_ANSWER_MAX];
+        find_case_answer(tc, model_output, got, sizeof(got));
+        bool ok = answer_matches(tc, got);
+        if (ok) passed++;
+        else failed++;
+
+        bool traced_ok = !strcmp(traced_status, "PASSED");
+        if ((traced_status[0] && ok != traced_ok) ||
+            (traced_pick[0] && strcmp(got, traced_pick) != 0)) {
+            changed++;
+            printf("case %d %s/%s: trace %s picked=%s -> regrade %s picked=%s expected=%s\n",
+                   total, source, id,
+                   traced_status[0] ? traced_status : "?",
+                   traced_pick[0] ? traced_pick : "?",
+                   ok ? "PASSED" : "FAILED", got, tc->answer ? tc->answer : "?");
+        }
+        free(model_output);
+    }
+
+    printf("ds4-eval: regraded %d cases from %s: passed=%d failed=%d changed=%d unknown=%d parse_errors=%d\n",
+           total, path, passed, failed, changed, unknown, parse_errors);
+    free(text);
+    return (unknown || parse_errors || total == 0) ? 1 : 0;
+}
+
+static int extractor_self_test_case(const char *name, const eval_case *tc,
+                                    const char *generated,
+                                    const char *expected_extract) {
+    char got[EVAL_ANSWER_MAX];
+    find_case_answer(tc, generated, got, sizeof(got));
+    if (strcmp(got, expected_extract) == 0 && answer_matches(tc, got)) return 0;
+
+    fprintf(stderr,
+            "ds4-eval: extractor self-test failed: %s (got %s, expected %s, key %s)\n",
+            name, got, expected_extract, tc->answer ? tc->answer : "?");
+    return 1;
+}
+
+static int trace_copy_self_test_case(void) {
+    const char *prompt_output =
+        "Prompt text may mention\n"
+        "MODEL_OUTPUT_BEGIN without being the model block.\n";
+    const char *model_output =
+        "</think>Trace payload may mention\n"
+        "MODEL_OUTPUT_END before the real marker.\n"
+        "===== CASE not a real case =====\n"
+        "Answer: F";
+    char trace_case[1024];
+    int n = snprintf(trace_case, sizeof(trace_case),
+                     "===== CASE 1/2 SuperGPQA/trace-copy-self-test =====\n"
+                     "source: SuperGPQA\n"
+                     "id: trace-copy-self-test\n"
+                     "QUESTION_PROMPT_BEGIN bytes=%zu\n"
+                     "%s\n"
+                     "QUESTION_PROMPT_END\n"
+                     "MODEL_OUTPUT_BEGIN bytes=%zu\n"
+                     "%s\n"
+                     "MODEL_OUTPUT_END\n"
+                     "\n"
+                     "===== CASE 2/2 SuperGPQA/trace-copy-self-test-2 =====\n",
+                     strlen(prompt_output), prompt_output,
+                     strlen(model_output), model_output);
+    if (n < 0 || (size_t)n >= sizeof(trace_case)) {
+        fprintf(stderr, "ds4-eval: trace self-test setup failed\n");
+        return 1;
+    }
+
+    const char *trace_start = trace_case;
+    const char *trace_end = trace_case + strlen(trace_case);
+    const char *first = trace_find_next_case(trace_start, trace_end);
+    const char *after_header = first ? memchr(first, '\n', (size_t)(trace_end - first)) : NULL;
+    after_header = after_header ? after_header + 1 : trace_end;
+    const char *second = first ? trace_find_next_case(after_header, trace_end) : NULL;
+    if (!first || !second || !strstr(second, "===== CASE 2/2")) {
+        fprintf(stderr, "ds4-eval: trace self-test failed: embedded case marker skip\n");
+        return 1;
+    }
+
+    char *copied = trace_copy_model_output(first, second);
+    if (!copied || strcmp(copied, model_output) != 0) {
+        fprintf(stderr, "ds4-eval: trace self-test failed: MODEL_OUTPUT byte copy\n");
+        free(copied);
+        return 1;
+    }
+    free(copied);
+    return 0;
+}
+
+static int run_extractor_self_tests(void) {
+    int failed = 0;
+
+    failed += trace_copy_self_test_case();
+
+    const eval_case mc = {
+        .source = "SuperGPQA",
+        .choice[0] = "A",
+        .choice[1] = "B",
+        .choice[2] = "C",
+        .choice[3] = "D",
+        .choice[4] = "E",
+        .choice[5] = "F",
+        .choice[6] = "G",
+        .choice[7] = "H",
+        .choice[8] = "I",
+        .choice[9] = "J",
+        .answer = "F",
+    };
+    failed += extractor_self_test_case(
+        "multiple-choice prefers final answer marker",
+        &mc,
+        "</think>So answer is 0.716 H+/O2. That corresponds to option F.\n"
+        "Thus final answer: F.</think>The visible explanation repeats the calculation.\n"
+        "Answer: F",
+        "F");
+    failed += extractor_self_test_case(
+        "multiple-choice prefers Answer-colon over later prose",
+        &mc,
+        "</think>Answer: F\nThis answer is final; option H is a tempting distractor.",
+        "F");
+    failed += extractor_self_test_case(
+        "multiple-choice preserves loose-answer fallback",
+        &mc,
+        "</think>The answer is F. This answer is final; option H is tempting.",
+        "F");
+
+    const eval_case integer = {
+        .source = "AIME2025",
+        .answer = "82",
+    };
+    failed += extractor_self_test_case(
+        "integer prefers final answer marker",
+        &integer,
+        "</think>I first thought the answer was 80.\nFinal answer: 082",
+        "82");
+    failed += extractor_self_test_case(
+        "integer preserves loose-answer fallback",
+        &integer,
+        "</think>The answer is 082. This answer comes from AIME 2025.",
+        "82");
+
+    const eval_case compsec = {
+        .source = "COMPSEC",
+        .answer = "9-10",
+    };
+    failed += extractor_self_test_case(
+        "COMPSEC prefers final answer marker",
+        &compsec,
+        "</think>I think the answer should be line 10, because CWE-122 may apply.\n"
+        "**Answer:** 10</think>The primary write is at line 10.\n"
+        "Answer: 10",
+        "10");
+
+    if (failed) return 1;
+    printf("ds4-eval: answer extractor self-tests passed\n");
+    return 0;
 }
 
 static bool tui_has_switch_request(eval_ui *ui, int running_idx) {
@@ -2396,6 +3334,10 @@ static bool tui_has_switch_request(eval_ui *ui, int running_idx) {
            ui->requested_case >= 0 &&
            ui->requested_case < ui->ncases &&
            ui->requested_case != running_idx;
+}
+
+static bool tui_has_quit_request(eval_ui *ui) {
+    return ui->enabled && ui->quit_requested;
 }
 
 static void mark_case_pending(eval_ui *ui, int idx) {
@@ -2421,7 +3363,9 @@ static double tui_wait_if_paused(eval_ui *ui, const char *phase) {
 
 static void eval_prefill_progress(void *ud, const char *event, int current, int total) {
     eval_ui *ui = ud;
-    if (!ui || !event || strcmp(event, "prefill_chunk")) return;
+    if (!ui || !event) return;
+    if (strcmp(event, "prefill_chunk") && strcmp(event, "prefill_display"))
+        return;
     tui_consume_input(ui);
     tui_run_clock_tick(ui);
     ui->prefill_current = current;
@@ -2440,9 +3384,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     const bool tty = ui->enabled;
     const bool use_plain_color = !tty && isatty(STDOUT_FILENO);
     const ds4_think_mode think_mode = ds4_think_mode_for_context(cfg->think_mode, cfg->ctx_size);
-    const char *system =
-        "You are solving a hard benchmark question. Reason carefully. "
-        "The final answer must follow the requested format exactly.";
+    const char *system = eval_system_prompt();
 
     char *question = build_question_prompt(tc);
     if (!question) {
@@ -2456,14 +3398,42 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     ui->generated_tokens[idx] = 0;
 
     if (prompt.len >= cfg->ctx_size) {
-        fprintf(stderr, "ds4-eval: prompt for %s has %d tokens, ctx=%d\n",
-                tc->id, prompt.len, cfg->ctx_size);
-        trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR",
+        ui->active_case = idx;
+        if (!ui->selection_active) ui->selected_case = idx;
+        ui->guess[idx][0] = '\0';
+        ui->status[idx] = EVAL_SKIPPED;
+        tui_refresh(ui, "idle");
+        trace_write_case(trace, cfg, tc, idx, ui->ncases, "SKIPPED",
                          "prompt does not fit context", system, question, "",
                          think_mode, prompt.len, 0, 0.0, "?", NULL);
+        if (!tty) {
+            printf("\n[%d/%d] SKIPPED %s/%s prompt=%d ctx=%d\n",
+                   idx + 1, ui->ncases, tc->source, tc->id, prompt.len, cfg->ctx_size);
+        }
         free(question);
         ds4_tokens_free(&prompt);
-        return EVAL_RUN_ERROR;
+        return EVAL_RUN_OK;
+    }
+
+    int generation_limit = cfg->max_tokens;
+    int ctx_generation_limit = cfg->ctx_size - prompt.len;
+    if (ctx_generation_limit < generation_limit) generation_limit = ctx_generation_limit;
+    if (generation_limit < 1) {
+        ui->active_case = idx;
+        if (!ui->selection_active) ui->selected_case = idx;
+        ui->guess[idx][0] = '\0';
+        ui->status[idx] = EVAL_SKIPPED;
+        tui_refresh(ui, "idle");
+        trace_write_case(trace, cfg, tc, idx, ui->ncases, "SKIPPED",
+                         "prompt leaves no generation room", system, question, "",
+                         think_mode, prompt.len, 0, 0.0, "?", NULL);
+        if (!tty) {
+            printf("\n[%d/%d] SKIPPED %s/%s prompt=%d ctx=%d\n",
+                   idx + 1, ui->ncases, tc->source, tc->id, prompt.len, cfg->ctx_size);
+        }
+        free(question);
+        ds4_tokens_free(&prompt);
+        return EVAL_RUN_OK;
     }
 
     ui->active_case = idx;
@@ -2471,6 +3441,9 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     ui->requested_case = -1;
     ui->guess[idx][0] = '\0';
     ui->status[idx] = EVAL_PREFILL;
+    ui->max_tokens = generation_limit;
+    ui->think_max_tokens = generation_limit - cfg->hard_limit_reply_budget;
+    if (ui->think_max_tokens < 0) ui->think_max_tokens = 0;
     tui_run_clock_start(ui);
     if (tty) {
         tui_reset_stream(ui, tc, ds4_think_mode_enabled(think_mode));
@@ -2489,8 +3462,10 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
 
     char err[256];
     ds4_session_set_progress(session, eval_prefill_progress, ui);
+    ds4_session_set_display_progress(session, eval_prefill_progress, ui);
     if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
         ds4_session_set_progress(session, NULL, NULL);
+        ds4_session_set_display_progress(session, NULL, NULL);
         tui_run_clock_stop(ui);
         fprintf(stderr, "ds4-eval: prefill failed for %s: %s\n", tc->id, err);
         trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR", err,
@@ -2500,12 +3475,23 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         return EVAL_RUN_ERROR;
     }
     ds4_session_set_progress(session, NULL, NULL);
+    ds4_session_set_display_progress(session, NULL, NULL);
     int prompt_tokens = prompt.len;
     ui->prompt_tokens[idx] = prompt_tokens;
     ds4_tokens_free(&prompt);
 
     tui_consume_input(ui);
     tui_wait_if_paused(ui, "prefill");
+    if (tui_has_quit_request(ui)) {
+        ui->status[idx] = EVAL_STOPPED;
+        ui->generated_tokens[idx] = 0;
+        tui_run_clock_stop(ui);
+        tui_refresh(ui, "idle");
+        trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
+                         system, question, "", think_mode, prompt_tokens, 0, 0.0, "?", NULL);
+        free(question);
+        return EVAL_RUN_QUIT;
+    }
     if (tui_has_switch_request(ui, idx)) {
         mark_case_pending(ui, idx);
         tui_run_clock_stop(ui);
@@ -2532,9 +3518,23 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
     const int eos = ds4_token_eos(engine);
     double t0 = ui->phase_start_sec;
     int forced_close_pos = -1;
-    for (int i = 0; i < cfg->max_tokens; i++) {
+    for (int i = 0; i < generation_limit; i++) {
         if (tty) {
             tui_consume_input(ui);
+            if (tui_has_quit_request(ui)) {
+                ui->status[idx] = EVAL_STOPPED;
+                ui->generated_tokens[idx] = ui->generated;
+                tui_run_clock_stop(ui);
+                tui_refresh(ui, "idle");
+                trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
+                                 system, question, raw.v ? raw.v : "", think_mode,
+                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 &think_close);
+                free(question);
+                ds4_tokens_free(&think_close_tokens);
+                buf_free(&raw);
+                return EVAL_RUN_QUIT;
+            }
             if (tui_has_switch_request(ui, idx)) {
                 mark_case_pending(ui, idx);
                 ui->generated_tokens[idx] = ui->generated;
@@ -2554,6 +3554,20 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
                 ui->phase_start_sec += paused_sec;
                 t0 += paused_sec;
             }
+            if (tui_has_quit_request(ui)) {
+                ui->status[idx] = EVAL_STOPPED;
+                ui->generated_tokens[idx] = ui->generated;
+                tui_run_clock_stop(ui);
+                tui_refresh(ui, "idle");
+                trace_write_case(trace, cfg, tc, idx, ui->ncases, "STOPPED", NULL,
+                                 system, question, raw.v ? raw.v : "", think_mode,
+                                 prompt_tokens, ui->generated, now_sec() - t0, "?",
+                                 &think_close);
+                free(question);
+                ds4_tokens_free(&think_close_tokens);
+                buf_free(&raw);
+                return EVAL_RUN_QUIT;
+            }
             if (tui_has_switch_request(ui, idx)) {
                 mark_case_pending(ui, idx);
                 ui->generated_tokens[idx] = ui->generated;
@@ -2570,7 +3584,7 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             }
         }
 
-        int remaining_budget = cfg->max_tokens - ui->generated;
+        int remaining_budget = generation_limit - ui->generated;
         int close_rank = 0;
         int token = -1;
         eval_think_close_kind close_kind = EVAL_THINK_CLOSE_NONE;
@@ -2601,7 +3615,8 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
             }
         }
         if (token < 0)
-            token = ds4_session_sample(session, cfg->temperature, 0, cfg->top_p, 0.0f, rng);
+            token = ds4_session_sample(session, cfg->temperature, 0,
+                                       cfg->top_p, cfg->min_p, rng);
         if (token == eos) break;
         if (close_kind != EVAL_THINK_CLOSE_NONE &&
             think_close.kind == EVAL_THINK_CLOSE_NONE) {
@@ -2701,8 +3716,70 @@ static int next_pending_case(eval_ui *ui, int start) {
     return -1;
 }
 
-static void log_context_memory(ds4_backend backend, int ctx_size) {
-    ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
+static int parse_case_sequence(const char *arg, int ncases, int **seq_out, int *len_out) {
+    int cap = 8;
+    int len = 0;
+    int *seq = malloc((size_t)cap * sizeof(*seq));
+    if (!seq) {
+        fprintf(stderr, "ds4-eval: out of memory while parsing --case-sequence\n");
+        return -1;
+    }
+
+    const char *p = arg;
+    while (p && *p) {
+        while (isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+        errno = 0;
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p || errno != 0 || v < 1 || v > ncases) {
+            fprintf(stderr,
+                    "ds4-eval: invalid --case-sequence entry near '%s' "
+                    "(valid range: 1..%d)\n",
+                    p, ncases);
+            free(seq);
+            return -1;
+        }
+        if (len == cap) {
+            cap *= 2;
+            int *new_seq = realloc(seq, (size_t)cap * sizeof(*seq));
+            if (!new_seq) {
+                fprintf(stderr, "ds4-eval: out of memory while parsing --case-sequence\n");
+                free(seq);
+                return -1;
+            }
+            seq = new_seq;
+        }
+        seq[len++] = (int)v - 1;
+        p = end;
+        while (isspace((unsigned char)*p)) p++;
+        if (*p == ',') {
+            p++;
+            continue;
+        }
+        if (*p) {
+            fprintf(stderr, "ds4-eval: expected comma in --case-sequence near '%s'\n", p);
+            free(seq);
+            return -1;
+        }
+    }
+    if (len == 0) {
+        fprintf(stderr, "ds4-eval: --case-sequence cannot be empty\n");
+        free(seq);
+        return -1;
+    }
+    *seq_out = seq;
+    *len_out = len;
+    return 0;
+}
+
+static void log_context_memory(ds4_backend backend,
+                               int         ctx_size,
+                               uint32_t    prefill_chunk) {
+    ds4_context_memory m =
+        ds4_context_memory_estimate_with_prefill(backend,
+                                                 ctx_size,
+                                                 prefill_chunk);
     fprintf(stderr,
             "ds4-eval: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -2713,10 +3790,40 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
             m.comp_cap);
 }
 
+static int wait_distributed_route(ds4_session *session) {
+    char err[256] = {0};
+    char last[256] = {0};
+    unsigned ticks = 0;
+    const struct timespec delay = {0, 250000000L};
+
+    for (;;) {
+        int ready = ds4_session_distributed_route_ready(session, err, sizeof(err));
+        if (ready > 0) {
+            if (ticks) fprintf(stderr, "ds4-eval: distributed route ready\n");
+            return 0;
+        }
+        if (ready < 0) {
+            fprintf(stderr,
+                    "ds4-eval: distributed route readiness failed: %s\n",
+                    err[0] ? err : "unknown error");
+            return 1;
+        }
+        const char *why = err[0] ? err : "route incomplete";
+        if (strcmp(last, why) != 0 || (ticks % 20u) == 0) {
+            fprintf(stderr, "ds4-eval: waiting for distributed route: %s\n", why);
+            snprintf(last, sizeof(last), "%s", why);
+        }
+        nanosleep(&delay, NULL);
+        ticks++;
+    }
+}
+
 static const char *report_status_name(eval_status st) {
     switch (st) {
     case EVAL_PASSED: return "PASSED";
     case EVAL_FAILED: return "FAILED";
+    case EVAL_SKIPPED: return "SKIPPED";
+    case EVAL_STOPPED: return "STOPPED";
     case EVAL_PREFILL: return "PREFILL";
     case EVAL_THINKING: return "RUNNING";
     case EVAL_PENDING:
@@ -2724,20 +3831,7 @@ static const char *report_status_name(eval_status st) {
     }
 }
 
-static const char *report_status_color(eval_status st, bool color) {
-    if (!color) return "";
-    switch (st) {
-    case EVAL_PASSED: return ANSI_GREEN;
-    case EVAL_FAILED: return ANSI_RED;
-    case EVAL_PREFILL:
-    case EVAL_THINKING: return ANSI_YELLOW;
-    case EVAL_PENDING:
-    default: return ANSI_DIM;
-    }
-}
-
 static void print_eval_report(const eval_ui *ui, int ncases, int passed, int failed) {
-    bool color = isatty(STDOUT_FILENO);
     char elapsed[32];
     format_run_elapsed(elapsed, sizeof(elapsed), tui_run_clock_visible_sec(ui));
 
@@ -2751,32 +3845,41 @@ static void print_eval_report(const eval_ui *ui, int ncases, int passed, int fai
         int generated_tokens = ui->generated_tokens ? ui->generated_tokens[i] : 0;
         int total_tokens = prompt_tokens + generated_tokens;
         const char *given = ui->guess && ui->guess[i][0] ? ui->guess[i] : "-";
-        const char *color_start = report_status_color(ui->status[i], color);
-        const char *color_end = color ? ANSI_RESET : "";
-        printf("%3d %s%-8s%s %8d %8d %8d %-8s %-8s %s/%s %s\n",
+        printf("%3d %-8s %8d %8d %8d %-8s %-8s %s/%s\n",
                i + 1,
-               color_start,
                report_status_name(ui->status[i]),
-               color_end,
                prompt_tokens,
                generated_tokens,
                total_tokens,
                given,
                ui->cases[i].answer,
                ui->cases[i].source,
-               ui->cases[i].id,
-               ui->cases[i].title);
+               ui->cases[i].id);
     }
 }
 
 int main(int argc, char **argv) {
     eval_config cfg = parse_options(argc, argv);
+    if (cfg.self_test_extractors) return run_extractor_self_tests();
+    if (cfg.regrade_trace_path) return regrade_trace_file(cfg.regrade_trace_path);
+
     int ncases = (int)(sizeof(eval_cases) / sizeof(eval_cases[0]));
     if (cfg.question_limit > 0 && cfg.question_limit < ncases) ncases = cfg.question_limit;
     if (cfg.question_limit > (int)(sizeof(eval_cases) / sizeof(eval_cases[0]))) {
         fprintf(stderr, "ds4-eval: only %zu questions are embedded\n",
                 sizeof(eval_cases) / sizeof(eval_cases[0]));
         return 2;
+    }
+    int *case_sequence = NULL;
+    int case_sequence_len = 0;
+    if (cfg.case_sequence &&
+        parse_case_sequence(cfg.case_sequence, ncases, &case_sequence, &case_sequence_len) != 0) {
+        return 2;
+    }
+    if (!cfg.seed) {
+        cfg.seed = (uint64_t)time(NULL) ^
+                   ((uint64_t)getpid() << 32) ^
+                   (uint64_t)clock();
     }
 
     FILE *trace = NULL;
@@ -2785,12 +3888,11 @@ int main(int argc, char **argv) {
         if (!trace) {
             fprintf(stderr, "ds4-eval: cannot open trace '%s': %s\n",
                     cfg.trace_path, strerror(errno));
+            free(case_sequence);
             return 2;
         }
-        trace_write_header(trace, &cfg, ncases);
     }
 
-    log_context_memory(cfg.backend, cfg.ctx_size);
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
         .mtp_path = cfg.mtp_path,
@@ -2798,21 +3900,72 @@ int main(int argc, char **argv) {
         .n_threads = cfg.threads,
         .mtp_draft_tokens = 1,
         .mtp_margin = 3.0f,
+        .power_percent = cfg.power_percent,
+        .prefill_chunk = cfg.prefill_chunk,
+        .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
+        .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
+        .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
+        .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .ssd_streaming = cfg.ssd_streaming,
+        .ssd_streaming_cold = cfg.ssd_streaming_cold,
+        .distributed = cfg.dist,
     };
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "ds4-eval: %s\n", dist_err);
+        if (trace) fclose(trace);
+        free(case_sequence);
+        return 2;
+    }
 
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) {
         if (trace) fclose(trace);
+        free(case_sequence);
         return 1;
     }
+
+    int max_prompt_tokens = 0;
+    int max_prompt_case = -1;
+    const bool auto_ctx = cfg.ctx_size <= 0;
+    if (auto_ctx) {
+        cfg.ctx_size = eval_auto_context_size(engine, &cfg, eval_cases, ncases,
+                                              &max_prompt_tokens, &max_prompt_case);
+        fprintf(stderr,
+                "ds4-eval: context auto-sized to %d tokens "
+                "(largest prompt=%d tokens, case=%d, generation budget=%d)\n",
+                cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, cfg.max_tokens);
+    } else {
+        max_prompt_tokens = eval_max_prompt_tokens(engine, &cfg, eval_cases, ncases,
+                                                   cfg.ctx_size, &max_prompt_case);
+        fprintf(stderr,
+                "ds4-eval: context set to %d tokens "
+                "(largest prompt=%d tokens, case=%d, generation budget=%d)\n",
+                cfg.ctx_size, max_prompt_tokens, max_prompt_case + 1, cfg.max_tokens);
+        eval_warn_context_budget(&cfg, max_prompt_tokens, max_prompt_case);
+    }
+    fprintf(stderr, "ds4-eval: model shape %s\n", ds4_engine_model_name(engine));
+    eval_warn_think_max_downgraded(&cfg);
+    trace_write_header(trace, &cfg, ds4_engine_model_name(engine), ncases, max_prompt_tokens);
+    log_context_memory(cfg.backend, cfg.ctx_size, cfg.prefill_chunk);
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
         fprintf(stderr, "ds4-eval: failed to create session\n");
         if (trace) fclose(trace);
         ds4_engine_close(engine);
+        free(case_sequence);
+        return 1;
+    }
+    if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
+        wait_distributed_route(session) != 0)
+    {
+        ds4_session_free(session);
+        if (trace) fclose(trace);
+        ds4_engine_close(engine);
+        free(case_sequence);
         return 1;
     }
 
@@ -2820,14 +3973,21 @@ int main(int argc, char **argv) {
     bool split_ui = !cfg.plain && isatty(STDOUT_FILENO);
     tui_start(&ui, eval_cases, ncases, cfg.max_tokens, split_ui);
 
-    uint64_t rng = cfg.seed ? cfg.seed :
-        ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+    uint64_t rng = cfg.seed;
     int rc = 0;
     int next = 0;
+    int sequence_pos = 0;
     while (next >= 0) {
+        if (case_sequence_len > 0) {
+            if (sequence_pos >= case_sequence_len) break;
+            next = case_sequence[sequence_pos++];
+            ui.selected_case = next;
+            ui.selection_active = false;
+        }
         tui_consume_input(&ui);
         tui_wait_if_paused(&ui, "idle");
-        if (ui.requested_case >= 0) {
+        if (ui.quit_requested) break;
+        if (case_sequence_len == 0 && ui.requested_case >= 0) {
             next = ui.requested_case;
             ui.requested_case = -1;
             ui.selection_active = false;
@@ -2839,6 +3999,13 @@ int main(int argc, char **argv) {
             rc = 1;
             break;
         }
+        if (result == EVAL_RUN_QUIT) break;
+        /* A successful case should advance to the next pending benchmark.  If a
+         * stale quit flag ever survives here, clear it; real q handling either
+         * returns EVAL_RUN_QUIT from run_one_case() or is consumed at the top of
+         * the next idle iteration. */
+        ui.quit_requested = false;
+        if (case_sequence_len > 0) continue;
         if (ui.requested_case >= 0) {
             next = ui.requested_case;
             ui.requested_case = -1;
@@ -2876,5 +4043,6 @@ int main(int argc, char **argv) {
     ds4_session_free(session);
     ds4_engine_close(engine);
     if (trace) fclose(trace);
+    free(case_sequence);
     return rc || failed ? 1 : 0;
 }
